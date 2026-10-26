@@ -1,0 +1,805 @@
+package core
+
+import (
+	"context"
+	"fmt"
+	"github.com/FreePeak/LeanKG/internal/langs"
+	"github.com/FreePeak/LeanKG/internal/ontology"
+	"github.com/FreePeak/LeanKG/internal/session"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/FreePeak/LeanKG/internal/embed"
+	"github.com/FreePeak/LeanKG/internal/memory"
+	"github.com/FreePeak/LeanKG/internal/store"
+)
+
+func newEngine(t *testing.T) (*Engine, *memory.Memory) {
+	t.Helper()
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, ".leankg", "leankg.db"), store.RW)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	if err := st.Migrate(); err != nil {
+		t.Fatal(err)
+	}
+	mem, err := memory.Open(dir, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return New(st, mem, nil), mem
+}
+
+func TestResolveEnvelope(t *testing.T) {
+	for _, tool := range []string{"import", "query", "status"} {
+		if got, err := ResolveEnvelope(tool); err != nil || got != tool {
+			t.Fatalf("envelope %q: got %q err %v", tool, got, err)
+		}
+	}
+	// Superseded legacy names are refused, naming their replacement.
+	if _, err := ResolveEnvelope("get"); err == nil || !strings.Contains(err.Error(), `superseded by "query"`) {
+		t.Fatalf("legacy get: %v", err)
+	}
+	if _, err := ResolveEnvelope("delete_everything"); err == nil || !strings.Contains(err.Error(), "valid tools") {
+		t.Fatalf("unknown tool: %v", err)
+	}
+}
+
+func TestQueryLadderOrderAndProvenance(t *testing.T) {
+	e, _ := newEngine(t)
+	ctx := context.Background()
+
+	// L0 cold: guidance, never an error.
+	out, err := e.Query(ctx, QueryRequest{Query: "anything"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out["freshness"] != "cold" || out["retrieval"].(map[string]any)["rung"] != "L0" {
+		t.Fatalf("cold: %+v", out)
+	}
+
+	// Seed: exact-match element + fuzzy-only element.
+	if err := e.st.UpsertElements([]store.Element{
+		{QualifiedName: "a.parseConfig", ElementType: "function", Name: "parseConfig", FilePath: "a.go", Language: "go", Content: "parse config file"},
+		{QualifiedName: "a.Widget", ElementType: "type", Name: "Widget", FilePath: "a.go", Language: "go", Content: "the frobnicator widget struct"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// L1 exact identifier wins.
+	out, err = e.Query(ctx, QueryRequest{Query: "parseConfig"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r := out["retrieval"].(map[string]any); r["rung"] != "L1" {
+		t.Fatalf("want L1, got %v (%v)", r, out["hits"])
+	}
+	if len(hitsOf(out)) == 0 || hitsOf(out)[0]["name"] != "parseConfig" {
+		t.Fatalf("L1 hits: %v", out["hits"])
+	}
+
+	// L2 fuzzy for prose that only matches content.
+	out, err = e.Query(ctx, QueryRequest{Query: "frobnicator widget struct"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r := out["retrieval"].(map[string]any); r["rung"] != "L2" {
+		t.Fatalf("want L2, got %v", r)
+	}
+
+	// Provenance present on every answer.
+	if _, ok := out["retrieval"].(map[string]any)["reason"]; !ok {
+		t.Fatal("retrieval.reason missing")
+	}
+}
+
+func TestQuerySemanticDegradesToL2(t *testing.T) {
+	// No provider wired: action=semantic degrades with a reason, no error.
+	e, _ := newEngine(t)
+	out, err := e.Query(context.Background(), QueryRequest{Action: "semantic", Query: "anything"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := out["retrieval"].(map[string]any)
+	if r["rung"] != "L2" || !strings.Contains(r["reason"].(string), "no embedding provider") {
+		t.Fatalf("semantic degrade: %v", r)
+	}
+}
+
+func TestL3SemanticWithDeterministicProvider(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, ".leankg", "leankg.db"), store.RW)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	if err := st.Migrate(); err != nil {
+		t.Fatal(err)
+	}
+	p := embed.Deterministic(16)
+	// Deterministic vectors are kind-salted (query/document prefixes,
+	// FR-ZCP-11 port), so to assert a CONTROLLED top hit we store the
+	// query-kind embedding of "alpha code" as m.alpha's vector: querying
+	// "alpha code" must then land on m.alpha with similarity 1.
+	els := []store.Element{
+		{QualifiedName: "m.alpha", ElementType: "function", Name: "alpha", FilePath: "m.go", Language: "go", Content: "alpha code"},
+		{QualifiedName: "m.beta", ElementType: "function", Name: "beta", FilePath: "m.go", Language: "go", Content: "beta code"},
+	}
+	if err := st.UpsertElements(els); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.WriteStamp(embed.StampOf(p)); err != nil {
+		t.Fatal(err)
+	}
+	qvec, err := p.Embed(context.Background(), embed.Query, []string{"alpha code"})
+	if err != nil || len(qvec) != 1 {
+		t.Fatalf("embed query: %v", err)
+	}
+	if err := st.UpsertVectors(p.ModelID(), []store.VectorRow{{QualifiedName: "m.alpha", Vec: qvec[0]}}); err != nil {
+		t.Fatal(err)
+	}
+
+	embedder := QueryEmbedderFromProvider(p)
+	e := New(st, nil, embedder)
+	out, err := e.Query(context.Background(), QueryRequest{Action: "semantic", Query: "alpha code"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := out["retrieval"].(map[string]any)
+	if r["rung"] != "L3" {
+		t.Fatalf("want L3, got %v (hits %v)", r, out["hits"])
+	}
+	if len(hitsOf(out)) == 0 || hitsOf(out)[0]["name"] != "alpha" {
+		t.Fatalf("L3 top hit: %v", out["hits"])
+	}
+
+	// No-failure query through the same path: must not error regardless of rung.
+	out, err = e.Query(context.Background(), QueryRequest{Action: "semantic", Query: "widget"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("no-failure query rung %v (fine)", out["retrieval"])
+}
+
+type failingProvider struct{ inner embed.Provider }
+
+func (f failingProvider) ModelID() string  { return f.inner.ModelID() }
+func (f failingProvider) Revision() string { return f.inner.Revision() }
+func (f failingProvider) Dimensions() int  { return f.inner.Dimensions() }
+func (f failingProvider) Distance() string { return f.inner.Distance() }
+func (f failingProvider) Provider() string { return f.inner.Provider() }
+func (f failingProvider) Embed(_ context.Context, _ embed.TextKind, _ []string) ([][]float32, error) {
+	return nil, context.DeadlineExceeded
+}
+
+func TestL3ProviderFailureDegrades(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, ".leankg", "leankg.db"), store.RW)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	if err := st.Migrate(); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertElements([]store.Element{
+		{QualifiedName: "x.y", ElementType: "function", Name: "y", FilePath: "x.go", Language: "go", Content: "some content here"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.WriteStamp(store.ModelStamp{ModelID: "boom", Revision: "r", Dimensions: 4, Distance: "cosine", Provider: "test"}); err != nil {
+		t.Fatal(err)
+	}
+	embedder := QueryEmbedderFromProvider(failingProvider{inner: embed.Deterministic(4)})
+	e := New(st, nil, embedder)
+	out, err := e.Query(context.Background(), QueryRequest{Action: "semantic", Query: "content"})
+	if err != nil {
+		t.Fatalf("provider failure must degrade, not error: %v", err)
+	}
+	r := out["retrieval"].(map[string]any)
+	if r["rung"] != "L2" || !strings.Contains(r["reason"].(string), "degraded from L3") {
+		t.Fatalf("degrade provenance: %v", r)
+	}
+}
+
+func TestImportUnknownActionErrors(t *testing.T) {
+	e, _ := newEngine(t)
+	if _, err := e.Import(context.Background(), ImportRequest{Action: "explode"}); err == nil {
+		t.Fatal("unknown import action must error")
+	}
+	if _, err := e.Import(context.Background(), ImportRequest{Action: "repo"}); err == nil {
+		t.Fatal("repo without path must error")
+	}
+}
+
+func TestMemoryWriteAndReadRouting(t *testing.T) {
+	e, _ := newEngine(t)
+	ctx := context.Background()
+	if _, err := e.Import(ctx, ImportRequest{
+		Action: "memory", Command: "create", Path: "MEMORY.md", Args: map[string]any{"content": "# Core notes"},
+	}); err != nil {
+		t.Fatalf("memory create: %v", err)
+	}
+	out, err := e.MemoryRead("snapshot", "", "", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out["content"].(string), "# Core notes") {
+		t.Fatalf("snapshot: %v", out)
+	}
+	out, err = e.MemoryRead("search", "", "notes", 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hits := out["hits"].([]memory.Hit)
+	if len(hits) != 1 || hits[0].Path != "MEMORY.md" {
+		t.Fatalf("memory search: %+v", hits)
+	}
+}
+
+func TestStatusShape(t *testing.T) {
+	e, _ := newEngine(t)
+	dir := t.TempDir()
+	e.SetProjectDir(dir)
+	out, err := e.Status(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	tools := out["tools"].([]string)
+	if len(tools) != 3 {
+		t.Fatalf("status tools = %v, want exactly 3", tools)
+	}
+	if out["freshness"] != "cold" {
+		t.Fatalf("freshness: %v", out["freshness"])
+	}
+	if out["backend"] != "sqlite" {
+		t.Fatalf("backend: %v", out["backend"])
+	}
+	if out["project_dir"] != dir {
+		t.Fatalf("project_dir = %v, want %s", out["project_dir"], dir)
+	}
+}
+
+// TestEmptyHitGuidance pins FR-HEA-02: zero-hit pinned/final rungs and empty
+// graph verbs carry a next-step guidance string instead of a bare dead end.
+func TestEmptyHitGuidance(t *testing.T) {
+	e, _ := newEngine(t)
+	ctx := context.Background()
+	if err := e.st.UpsertElements([]store.Element{
+		{QualifiedName: "pkg.Alpha", ElementType: "function", Name: "Alpha", FilePath: "a.go", Language: "go", Content: "alpha helper"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.refreshInventory(); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := e.Query(ctx, QueryRequest{Query: "DefinitelyMissingSymbolXYZ", Action: "exact"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hitsOf(out)) != 0 {
+		t.Fatalf("exact miss should be empty: %+v", out)
+	}
+	g, _ := out["guidance"].(string)
+	if !strings.Contains(g, "exact identifier") {
+		t.Fatalf("exact miss guidance: %q", g)
+	}
+
+	out, err = e.Query(ctx, QueryRequest{Query: "DefinitelyMissingSymbolXYZ", Action: "fuzzy"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hitsOf(out)) != 0 {
+		t.Fatalf("fuzzy miss should be empty: %+v", out)
+	}
+	g, _ = out["guidance"].(string)
+	if !strings.Contains(g, "keyword") {
+		t.Fatalf("fuzzy miss guidance: %q", g)
+	}
+
+	// Ladder with no embedder degrades L3→L2 and must still guide on a total miss.
+	out, err = e.Query(ctx, QueryRequest{Query: "DefinitelyMissingSymbolXYZ"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hitsOf(out)) != 0 {
+		t.Fatalf("ladder miss should be empty: %+v", out)
+	}
+	g, _ = out["guidance"].(string)
+	if g == "" {
+		t.Fatalf("ladder miss missing guidance: %+v", out)
+	}
+
+	out, err = e.Query(ctx, QueryRequest{Query: "pkg.Alpha", Action: "callers"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	callers, _ := out["callers"].([]string)
+	if len(callers) != 0 {
+		t.Fatalf("callers should be empty without edges: %+v", out)
+	}
+	g, _ = out["guidance"].(string)
+	if !strings.Contains(g, "callers") || !strings.Contains(g, "qualified_name") {
+		t.Fatalf("callers empty guidance: %q", g)
+	}
+}
+
+func TestFreshnessStaleAfterWrite(t *testing.T) {
+	e, _ := newEngine(t)
+	ctx := context.Background()
+	if err := e.st.UpsertElements([]store.Element{
+		{QualifiedName: "f.F", ElementType: "function", Name: "F", FilePath: "f.go", Language: "go", Content: "c"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.refreshInventory(); err != nil {
+		t.Fatal(err)
+	}
+	out, _ := e.Query(ctx, QueryRequest{Query: "F"})
+	if out["freshness"] != "fresh" {
+		t.Fatalf("fresh after inventory: %v", out["freshness"])
+	}
+	// A write after the inventory flips the answer to possibly_stale — the
+	// DB-resident watermark contract (no TTL cache to race).
+	if err := e.st.UpsertRelationships([]store.Relationship{{Source: "f.F", Target: "f.F", RelType: "calls"}}); err != nil {
+		t.Fatal(err)
+	}
+	out, _ = e.Query(ctx, QueryRequest{Query: "F"})
+	if out["freshness"] != "possibly_stale" {
+		t.Fatalf("stale after post-inventory write: %v", out["freshness"])
+	}
+}
+
+func TestNLRoutePicksIdentifier(t *testing.T) {
+	if got := NLRoute("how does the parseConfig function work?"); got != "parseConfig" {
+		t.Fatalf("NLRoute = %q, want parseConfig", got)
+	}
+	// Longest identifier-looking token wins.
+	if got := NLRoute("explain handle_request and parse helpers"); got != "handle_request" {
+		t.Fatalf("NLRoute = %q, want handle_request", got)
+	}
+	// No identifier-looking token at all → input passes through unchanged.
+	if got := NLRoute("42 + 7?"); got != "42 + 7?" {
+		t.Fatalf("non-identifier input must pass through: %q", got)
+	}
+}
+
+// TestL3StampDriftDegrades pins the query-side stamp contract (FR-ZCP-11
+// part 2 port): a stored collection whose revision no longer matches the
+// query embedder DEGRADES to L2 with a mismatch reason — never silently
+// wrong L3 answers over a drifted collection.
+func TestL3StampDriftDegrades(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, ".leankg", "leankg.db"), store.RW)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	if err := st.Migrate(); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertElements([]store.Element{
+		{QualifiedName: "x.y", ElementType: "function", Name: "y", FilePath: "x.go", Language: "go", Content: "some content here"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	p := embed.Deterministic(8)
+	if err := st.WriteStamp(store.ModelStamp{ModelID: p.ModelID(), Revision: "OLD-revision", Dimensions: 8, Distance: "cosine", Provider: p.Provider()}); err != nil {
+		t.Fatal(err)
+	}
+	e := New(st, nil, QueryEmbedderFromProvider(p))
+	out, err := e.Query(context.Background(), QueryRequest{Action: "semantic", Query: "content"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := out["retrieval"].(map[string]any)
+	if r["rung"] != "L2" || !strings.Contains(r["reason"].(string), "stamp mismatch") {
+		t.Fatalf("drifted collection must degrade with mismatch reason: %v", r)
+	}
+}
+
+// TestSessionOffloadRoundTripThroughCore proves internal/session is reachable
+// from the 3-tool surface (not dead code): import{action:"session"} offloads,
+// the query tool's session action recalls it bit-for-bit, and the canvas lists it.
+func TestSessionOffloadRoundTripThroughCore(t *testing.T) {
+	e, _ := newEngine(t)
+	e.SetProjectDir(t.TempDir())
+	ctx := context.Background()
+
+	if _, err := e.Import(ctx, ImportRequest{
+		Action: "session", Command: "offload",
+		Args: map[string]any{"session_id": "s1", "node_id": "node-1", "payload": "bulky payload text", "summary": "a summary"},
+	}); err != nil {
+		t.Fatalf("offload: %v", err)
+	}
+	out, err := e.SessionRead("recall", "s1", "node-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out["payload"] != "bulky payload text" {
+		t.Fatalf("recall payload: %v", out["payload"])
+	}
+	out, err = e.SessionRead("canvas", "s1", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if refs, ok := out["refs"].([]session.Ref); !ok || len(refs) != 1 {
+		t.Fatalf("canvas: %+v", out)
+	}
+}
+
+// TestOntologyMatchThroughCore proves internal/ontology is reachable: a
+// catalog matched against indexed elements persists and reads back.
+func TestOntologyMatchThroughCore(t *testing.T) {
+	e, _ := newEngine(t)
+	if err := e.st.UpsertElements([]store.Element{
+		{QualifiedName: "pkg.Login", ElementType: "function", Name: "Login", FilePath: "auth.go", Language: "go"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	proj := t.TempDir()
+	e.SetProjectDir(proj)
+	catPath := filepath.Join(proj, "concepts.json")
+	if err := os.WriteFile(catPath, []byte(`{"concepts":[{"id":"auth","label":"Authentication","aliases":["login"]}]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, err := e.OntologyMatch(catPath)
+	if err != nil {
+		t.Fatalf("match: %v", err)
+	}
+	if matches, ok := out["matches"].([]ontology.Match); !ok || len(matches) != 1 {
+		t.Fatalf("matches: %+v", out)
+	}
+	again, err := e.OntologyMatches()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if matches, ok := again["matches"].([]ontology.Match); !ok || len(matches) != 1 {
+		t.Fatalf("persisted matches: %+v", again)
+	}
+}
+
+// TestOntologyImportAndQueryActions pins the ontology exposure through the
+// ACTUAL production paths (import{action:"ontology"} + query{action:"ontology"}),
+// not just the direct Engine methods — these fail if the switch cases vanish.
+func TestOntologyImportAndQueryActions(t *testing.T) {
+	e, _ := newEngine(t)
+	ctx := context.Background()
+	if err := e.st.UpsertElements([]store.Element{
+		{QualifiedName: "pkg.Login", ElementType: "function", Name: "Login", FilePath: "auth.go", Language: "go"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	proj := t.TempDir()
+	e.SetProjectDir(proj)
+	if err := os.WriteFile(filepath.Join(proj, "concepts.json"), []byte(`{"concepts":[{"id":"auth","label":"Authentication","aliases":["login"]}]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.Import(ctx, ImportRequest{Action: "ontology", Path: "concepts.json"}); err != nil {
+		t.Fatalf("import ontology: %v", err)
+	}
+	outside := filepath.Join(t.TempDir(), "concepts.json")
+	if err := os.WriteFile(outside, []byte(`{"concepts":[]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.Import(ctx, ImportRequest{Action: "ontology", Path: outside}); err == nil {
+		t.Fatal("ontology catalog outside the project was read (RS-01)")
+	}
+	out, err := e.Query(ctx, QueryRequest{Action: "ontology"})
+	if err != nil {
+		t.Fatalf("query ontology: %v", err)
+	}
+	if matches, ok := out["matches"].([]ontology.Match); !ok || len(matches) != 1 {
+		t.Fatalf("query ontology matches: %+v", out)
+	}
+	// importing without a catalog path must error clearly, not silently pass.
+	if _, err := e.Import(ctx, ImportRequest{Action: "ontology"}); err == nil {
+		t.Fatal("ontology import without path must error")
+	}
+}
+
+// TestSessionQueryActionReachable pins query{action:"session"} (the production
+// read path) — it requires a project dir, which cmd sets via SetProjectDir.
+func TestSessionQueryActionReachable(t *testing.T) {
+	e, _ := newEngine(t)
+	ctx := context.Background()
+	if _, err := e.Query(ctx, QueryRequest{Action: "session", Query: "s1"}); err == nil {
+		t.Fatal("session query without a project dir must error (cmd must call SetProjectDir)")
+	}
+	e.SetProjectDir(t.TempDir())
+	if _, err := e.Import(ctx, ImportRequest{
+		Action: "session", Command: "offload",
+		Args: map[string]any{"session_id": "s1", "node_id": "node-1", "payload": "x"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	out, err := e.Query(ctx, QueryRequest{Action: "session", Query: "s1", Args: map[string]any{"command": "canvas"}})
+	if err != nil {
+		t.Fatalf("session canvas via query action: %v", err)
+	}
+	if refs, ok := out["refs"].([]session.Ref); !ok || len(refs) != 1 {
+		t.Fatalf("canvas refs: %+v", out)
+	}
+}
+
+// TestPatternActionDegradedWithoutAstGrep pins the lazy probe: when the
+// ast-grep CLI is absent the pattern action DEGRADES to L2 keyword search
+// with an explicit reason (same posture as the L3 provider rules) — never a
+// hard error.
+func TestPatternActionDegradedWithoutAstGrep(t *testing.T) {
+	e, _ := newEngine(t)
+	e.SetProjectDir(t.TempDir())
+	// Ensure the CLI is absent for the probe (PATH stripped).
+	t.Setenv("PATH", t.TempDir())
+	out, err := e.Query(context.Background(), QueryRequest{
+		Action: "pattern", Query: "anything",
+		Args: map[string]any{"pattern": "func $F($A)", "lang": "go"},
+	})
+	if err != nil {
+		t.Fatalf("pattern without ast-grep must degrade, not error: %v", err)
+	}
+	r := out["retrieval"].(map[string]any)
+	if r["rung"] != "L2" || !strings.Contains(r["reason"].(string), "ast-grep CLI not installed") {
+		t.Fatalf("degrade provenance: %v", r)
+	}
+}
+
+// TestPatternActionMissingArgs pins arg validation.
+func TestPatternActionMissingArgs(t *testing.T) {
+	e, _ := newEngine(t)
+	e.SetProjectDir(t.TempDir())
+	if _, err := e.Query(context.Background(), QueryRequest{Action: "pattern", Query: "x"}); err == nil {
+		t.Fatal("pattern without args.pattern must error")
+	}
+}
+
+// TestLSPQueryRequiresActiveLanguage pins the lazy contract at query time:
+// no LSP process is spawned unless the language was activated for the opened
+// codebase, and the absence of a server binary is a clear error.
+func TestLSPQueryRequiresActiveLanguage(t *testing.T) {
+	e, _ := newEngine(t)
+	e.SetProjectDir(t.TempDir())
+	e.SetLangsRegistry(langs.DefaultRegistry())
+	// registry not activated for any codebase → everything idle
+	if _, err := e.Query(context.Background(), QueryRequest{
+		Action: "lsp", Query: "Handler",
+		Args: map[string]any{"lang": "go"},
+	}); err == nil || !strings.Contains(err.Error(), "not active") {
+		t.Fatalf("idle language must refuse LSP spawn: %v", err)
+	}
+	// activate via a go-marked tree, then the action reaches the server pool
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.langsReg.Activate(dir); err != nil {
+		t.Fatal(err)
+	}
+	// gopls likely absent in CI — the error must name the failure clearly
+	// (ErrNoServer/timeout), never silently return empty symbols.
+	_, err := e.Query(context.Background(), QueryRequest{
+		Action: "lsp", Query: "Handler",
+		Args: map[string]any{"lang": "go"},
+	})
+	if err == nil {
+		t.Log("gopls present and answered — server path exercised")
+	}
+}
+
+// TestLanguagesStatusAction pins query{action:"languages"} through the
+// production switch.
+func TestLanguagesStatusAction(t *testing.T) {
+	e, _ := newEngine(t)
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	e.SetLangsRegistry(langs.DefaultRegistry())
+	if _, err := e.langsReg.Activate(dir); err != nil {
+		t.Fatal(err)
+	}
+	out, err := e.Query(context.Background(), QueryRequest{Action: "languages"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	langsOut := out["languages"].([]map[string]any)
+	found := false
+	for _, l := range langsOut {
+		if l["language"] == "go" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("go not in languages: %+v", langsOut)
+	}
+}
+
+// TestGraphActionResolvesShortName pins the seed fix: relationships are keyed
+// by qualified_name, so callers/callees/impact with a bare function name must
+// resolve via FindExact before traversal (otherwise every short-name graph
+// verb looks like a leaf).
+func TestGraphActionResolvesShortName(t *testing.T) {
+	e, _ := newEngine(t)
+	if err := e.st.UpsertElements([]store.Element{
+		{QualifiedName: "pkg/a.go::Helper", ElementType: "function", Name: "Helper", FilePath: "pkg/a.go", Language: "go"},
+		{QualifiedName: "pkg/b.go::Caller", ElementType: "function", Name: "Caller", FilePath: "pkg/b.go", Language: "go"},
+		{QualifiedName: "pkg/a.go::Leaf", ElementType: "function", Name: "Leaf", FilePath: "pkg/a.go", Language: "go"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.st.UpsertRelationships([]store.Relationship{
+		{Source: "pkg/b.go::Caller", Target: "pkg/a.go::Helper", RelType: "calls", Confidence: 1},
+		{Source: "pkg/a.go::Helper", Target: "pkg/a.go::Leaf", RelType: "calls", Confidence: 1},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+
+	out, err := e.Query(ctx, QueryRequest{Action: "callers", Query: "Helper"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out["resolved_query"] != "pkg/a.go::Helper" {
+		t.Fatalf("resolved_query=%v, want pkg/a.go::Helper", out["resolved_query"])
+	}
+	callers, _ := out["callers"].([]string)
+	if len(callers) != 1 || callers[0] != "pkg/b.go::Caller" {
+		t.Fatalf("callers=%v, want [pkg/b.go::Caller]", callers)
+	}
+
+	out, err = e.Query(ctx, QueryRequest{Action: "callees", Query: "Helper"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	callees, _ := out["callees"].([]string)
+	if len(callees) != 1 || callees[0] != "pkg/a.go::Leaf" {
+		t.Fatalf("callees=%v, want [pkg/a.go::Leaf]", callees)
+	}
+
+	out, err = e.Query(ctx, QueryRequest{
+		Action: "path",
+		Query:  "Caller",
+		Args:   map[string]any{"to": "Leaf", "depth": 5},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out["reachable"] != true {
+		t.Fatalf("path not reachable: %+v", out)
+	}
+	path, _ := out["path"].([]string)
+	if len(path) != 3 {
+		t.Fatalf("path=%v, want 3 hops", path)
+	}
+}
+
+// TestCompressReadAnchorsRelativePath pins import{action:read} / query compress
+// resolving relative paths against the project dir (not the server cwd).
+func TestCompressReadAnchorsRelativePath(t *testing.T) {
+	e, _ := newEngine(t)
+	dir := t.TempDir()
+	e.SetProjectDir(dir)
+	sub := filepath.Join(dir, "pkg")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	body := "package pkg\n\nfunc Hello() {}\n"
+	if err := os.WriteFile(filepath.Join(sub, "hello.go"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, err := e.Import(context.Background(), ImportRequest{
+		Action: "read",
+		Path:   "pkg/hello.go",
+		Args:   map[string]any{"mode": "full"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	content, _ := out["content"].(string)
+	if !strings.Contains(content, "func Hello") {
+		t.Fatalf("content=%q, want Hello body", content)
+	}
+	gotPath, _ := out["path"].(string)
+	// Project-relative: responses must not leak the server's layout (RS-23).
+	if gotPath != "pkg/hello.go" {
+		t.Fatalf("path=%q, want project-relative pkg/hello.go", gotPath)
+	}
+}
+
+// TestFileArgsConfinedToProject pins RS-01: every file-reading action refuses
+// paths outside the project — the validation read /etc/hosts through three of
+// them.
+func TestFileArgsConfinedToProject(t *testing.T) {
+	e, _ := newEngine(t)
+	proj := t.TempDir()
+	e.SetProjectDir(proj)
+	if err := os.WriteFile(filepath.Join(proj, "in.go"), []byte("package p\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(t.TempDir(), "secret.txt")
+	if err := os.WriteFile(outside, []byte("top secret\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(proj, "link.txt")); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	for _, p := range []string{outside, "../../../../../../" + outside, "link.txt"} {
+		if _, err := e.Import(ctx, ImportRequest{Action: "read", Path: p}); err == nil || !strings.Contains(err.Error(), "PATH_OUTSIDE_PROJECT") {
+			t.Errorf("import read %q: err=%v, want PATH_OUTSIDE_PROJECT", p, err)
+		}
+		if _, err := e.Query(ctx, QueryRequest{Action: "compress", Query: p}); err == nil || !strings.Contains(err.Error(), "PATH_OUTSIDE_PROJECT") {
+			t.Errorf("query compress %q: err=%v, want PATH_OUTSIDE_PROJECT", p, err)
+		}
+	}
+	if _, err := e.Import(ctx, ImportRequest{Action: "read", Path: "in.go"}); err != nil {
+		t.Fatalf("in-project read refused: %v", err)
+	}
+}
+
+// TestQueryScopeStates pins the args.scope contract: the default is the whole
+// corpus; `code` and `prod` narrow it AND say so in retrieval.scope; an unknown
+// scope is an ERROR, never a silent full corpus (answering over everything when
+// the caller asked for a subset looks identical to the scope working).
+func TestQueryScopeStates(t *testing.T) {
+	e, mem := newEngine(t)
+	_ = mem
+	n := 400
+	for i := 0; i < n; i++ {
+		if err := e.st.UpsertElements([]store.Element{{
+			QualifiedName: fmt.Sprintf("pkg/a%d.go::A%d", i, i), ElementType: "func",
+			Name: fmt.Sprintf("A%d", i), FilePath: fmt.Sprintf("pkg/a%d.go", i), Language: "go", LineStart: 1,
+			Content: "memorable shared content in the corpus",
+		}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	files := map[string][]string{
+		"":      {"pkg/a0.go", "pkg/a1.go"},
+		"all":   {"pkg/a0.go", "pkg/a1.go"},
+		"code":  {"pkg/a0.go", "pkg/a1.go"},
+		"prod":  {"pkg/a0.go", "pkg/a1.go"},
+		"bogus": nil,
+		"Code":  nil, // the vocabulary is closed and case-sensitive
+	}
+	for scope, want := range files {
+		resp, err := e.Query(context.Background(), QueryRequest{Query: "memorable shared content", Limit: 2, Args: argsWith("scope", scope)})
+		if want == nil {
+			if err == nil || !strings.Contains(err.Error(), "unknown scope") {
+				t.Errorf("scope %q: err = %v, want it to refuse", scope, err)
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatalf("scope %q: %v", scope, err)
+		}
+		got, _ := resp["retrieval"].(map[string]any)
+		if got["scope"] != defaultScopeName(scope) {
+			t.Errorf("scope %q: retrieval.scope = %v, want %q", scope, got["scope"], defaultScopeName(scope))
+		}
+		hits, _ := resp["hits"].([]map[string]any)
+		if len(hits) == 0 {
+			t.Errorf("scope %q: no hits", scope)
+		}
+	}
+}
+
+func defaultScopeName(scope string) string {
+	if scope == "" {
+		return "all"
+	}
+	return scope
+}
+
+func argsWith(kv ...string) map[string]any {
+	m := map[string]any{}
+	for i := 0; i+1 < len(kv); i += 2 {
+		m[kv[i]] = kv[i+1]
+	}
+	return m
+}

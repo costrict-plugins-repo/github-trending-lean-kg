@@ -1,0 +1,444 @@
+package main
+
+import (
+	"bufio"
+	"encoding/json"
+	"io"
+	"net"
+	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+)
+
+// buildLeanKG compiles the real CLI into a temp dir. Both guards below need
+// the actual binary: the whole point is to execute what clients and hooks
+// execute, which string-equality tests cannot check.
+func buildLeanKG(t *testing.T) string {
+	t.Helper()
+	if testing.Short() {
+		t.Skip("builds the leankg binary")
+	}
+	bin := filepath.Join(t.TempDir(), "leankg")
+	cmd := exec.Command("go", "build", "-o", bin, "./cmd/leankg")
+	cmd.Dir = "../.."
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("go build: %v\n%s", err, out)
+	}
+	return bin
+}
+
+// seedProject builds a one-file Go repo for a spawn or hook to target.
+func seedProject(t *testing.T) string {
+	t.Helper()
+	proj := t.TempDir()
+	if err := os.WriteFile(filepath.Join(proj, "demo.go"),
+		[]byte("package demo\n\nfunc Handle(id string) string { return id }\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return proj
+}
+
+// TestStdioSpawnServesMCP is the end-to-end guard for the client wiring: the
+// argv `connect`/`install` write into client configs must actually start an MCP
+// server. It builds the real binary and drives the emitted spawn
+// (`stdioArgs("")`) over stdio, asserting the handshake and the 3-tool
+// registry. The wiring used to emit `leankg mcp-stdio` — a subcommand this
+// binary does not have — so every wired client spawned a process that died
+// immediately, and the pinned strings in connect_test.go said nothing.
+func TestStdioSpawnServesMCP(t *testing.T) {
+	bin := buildLeanKG(t)
+	proj := seedProject(t)
+
+	cmd := exec.Command(bin, stdioArgs("", "")...)
+	cmd.Dir = proj // projectless contract: the server resolves cwd
+	cmd.Stderr = nil
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("spawn %v: %v", cmd.Args, err)
+	}
+	defer func() {
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		_, _ = cmd.Process.Wait()
+	}()
+
+	write := func(line string) {
+		t.Helper()
+		if _, err := stdin.Write([]byte(line + "\n")); err != nil {
+			t.Fatalf("stdin write: %v", err)
+		}
+	}
+	// Newline-delimited JSON-RPC over stdio. tools/list is rejected outright
+	// unless initialize is answered first, so the order carries meaning.
+	write(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"wiring-test","version":"0"}}}`)
+	write(`{"jsonrpc":"2.0","method":"notifications/initialized"}`)
+	write(`{"jsonrpc":"2.0","id":2,"method":"tools/list"}`)
+	// A memory write over the exact argv install/connect write into client
+	// configs. Without --memory on that argv the layer is nil and the write
+	// fails with "memory not initialized".
+	write(`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"import","arguments":{"action":"memory","command":"create","args":{"path":"topics/wiring.md","content":"Alpha calls Beta"}}}}`)
+
+	lines := make(chan string, 16)
+	go func() {
+		defer close(lines)
+		scanner := bufio.NewScanner(stdout)
+		scanner.Buffer(make([]byte, 0, 1<<20), 1<<20)
+		for scanner.Scan() {
+			lines <- scanner.Text()
+		}
+	}()
+
+	sawServerInfo, sawTools, sawMemory := false, false, false
+	// Generous: covers a cold `go build` plus the first memory write.
+	timeout := time.After(60 * time.Second)
+	for !sawServerInfo || !sawTools || !sawMemory {
+		select {
+		case <-timeout:
+			t.Fatalf("spawn never completed the MCP handshake (serverInfo=%v tools=%v)", sawServerInfo, sawTools)
+		case line, ok := <-lines:
+			if !ok {
+				t.Fatalf("spawn closed stdout before the handshake completed (serverInfo=%v tools=%v)", sawServerInfo, sawTools)
+			}
+			var resp struct {
+				ID     int `json:"id"`
+				Result struct {
+					ServerInfo struct {
+						Name string `json:"name"`
+					} `json:"serverInfo"`
+					Tools []struct {
+						Name string `json:"name"`
+					} `json:"tools"`
+				} `json:"result"`
+			}
+			if err := json.Unmarshal([]byte(line), &resp); err != nil {
+				continue // notifications are not responses
+			}
+			switch resp.ID {
+			case 1:
+				if resp.Result.ServerInfo.Name != "leankg" {
+					t.Fatalf("serverInfo.name = %q, want leankg", resp.Result.ServerInfo.Name)
+				}
+				sawServerInfo = true
+			case 2:
+				names := map[string]bool{}
+				for _, tool := range resp.Result.Tools {
+					names[tool.Name] = true
+				}
+				for _, want := range []string{"import", "query", "status"} {
+					if !names[want] {
+						t.Fatalf("tools/list missing %q: got %v", want, names)
+					}
+				}
+				sawTools = true
+			case 3:
+				// The memory layer is reachable only when the spawn argv
+				// carries --memory; without it every memory write fails with
+				// "memory not initialized". Assert the write succeeds over the
+				// exact argv install/connect write into client configs.
+				if strings.Contains(line, "memory not initialized") {
+					t.Fatalf("memory write over the wired argv failed: %s", line)
+				}
+				if !strings.Contains(line, `\"ok\":true`) {
+					t.Fatalf("memory write over the wired argv did not succeed: %s", line)
+				}
+				sawMemory = true
+			}
+		}
+	}
+}
+
+// TestHookCommandRuns guards the other wiring artifact: the SessionStart hook
+// string RegisterCWD writes into ~/.claude/settings.json must run. It used to
+// be `leankg add <dir>`, a Rust-era verb with no Go case, so Claude Code would
+// fail the hook every session. The assertion is behavioral: run the expanded
+// hook and require the store it promises to create.
+func TestHookCommandRuns(t *testing.T) {
+	bin := buildLeanKG(t)
+
+	expanded := hookCommand(bin)
+	if !strings.Contains(expanded, ` index --hook "$CLAUDE_PROJECT_DIR"`) {
+		t.Fatalf("hook %q: expected `index --hook \"$CLAUDE_PROJECT_DIR\"` (quoted, shell-expanded)", expanded)
+	}
+	proj := seedProject(t)
+	// Claude Code executes the hook through a shell and expands the variable;
+	// mirror that, including a project path containing a space (the quoted
+	// variable must survive it).
+	projSpace := proj + " with space"
+	if err := os.Rename(proj, projSpace); err != nil {
+		t.Fatal(err)
+	}
+	script := strings.ReplaceAll(expanded, "$CLAUDE_PROJECT_DIR", projSpace)
+	if out, err := exec.Command("sh", "-c", script).CombinedOutput(); err != nil {
+		t.Fatalf("hook %q: %v\n%s", script, err, out)
+	}
+	if _, err := os.Stat(filepath.Join(projSpace, ".leankg", "leankg.db")); err != nil {
+		t.Fatalf("hook ran but created no store under %s/.leankg: %v", projSpace, err)
+	}
+}
+
+// TestDashboardListenerServesHealthAndShell guards the container deploy shape:
+// `serve --ui :PORT` is the ONE listener the image exposes, and the platform
+// health check points at /health on it. The SPA fallback answers 200 + HTML for
+// any unknown path, so a health check that only wants a 200 would pass even
+// with a broken data API — /health must answer JSON instead, and the shell and
+// favicon must come from the embedded build. Store is indexed first because
+// the read-only role refuses to open a missing store.
+func TestDashboardListenerServesHealthAndShell(t *testing.T) {
+	bin := buildLeanKG(t)
+	proj := seedProject(t)
+	if out, err := exec.Command(bin, "index", proj, "--auto").CombinedOutput(); err != nil {
+		t.Fatalf("index: %v\n%s", err, out)
+	}
+
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := l.Addr().String()
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.Command(bin, "serve", "--read-only", "--ui", addr, "--project", proj)
+	cmd.Stdout, cmd.Stderr = io.Discard, io.Discard
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("serve: %v", err)
+	}
+	defer func() {
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+	}()
+
+	get := func(path string) (int, string, string) {
+		t.Helper()
+		res, err := http.Get("http://" + addr + path)
+		if err != nil {
+			return 0, "", ""
+		}
+		defer res.Body.Close()
+		body, _ := io.ReadAll(res.Body)
+		return res.StatusCode, res.Header.Get("Content-Type"), string(body)
+	}
+
+	code := 0
+	for deadline := time.Now().Add(15 * time.Second); time.Now().Before(deadline) && code != 200; {
+		code, _, _ = get("/health")
+		if code != 200 {
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
+	if code, ctype, body := get("/health"); code != 200 || !strings.Contains(ctype, "application/json") || body != `{"ok":true}` {
+		t.Fatalf("GET /health: %d %s %s (want 200 application/json {\"ok\":true})", code, ctype, body)
+	}
+	if code, ctype, body := get("/"); code != 200 || !strings.Contains(ctype, "text/html") || !strings.Contains(body, `id="root"`) {
+		t.Fatalf("GET /: %d %s (embedded dashboard shell not served)", code, ctype)
+	}
+	if code, ctype, _ := get("/favicon.svg"); code != 200 || !strings.Contains(ctype, "image/svg+xml") {
+		t.Fatalf("GET /favicon.svg: %d %s", code, ctype)
+	}
+}
+
+// TestServeSurvivesUnusableEmbedProvider is the guard for the defect that made
+// an MCP client report the server "unreachable": `serve --embed-provider
+// local` used to log.Fatal when the provider would not start, and a busy
+// sidecar port — a previous run's llama-server, a dev tunnel — is the common
+// way to get there. The server then died before binding, so the client's
+// health probe found nothing and the only trace was a llama-server stderr
+// tail in a log nobody reads. A query-time embedder is optional (L3 degrades
+// with a reason, see core.rungSemantic), so serve must bind and serve
+// anyway. Two cases: the sidecar port held by a stranger, and a sidecar
+// command that does not exist.
+func TestServeSurvivesUnusableEmbedProvider(t *testing.T) {
+	bin := buildLeanKG(t)
+	proj := seedProject(t)
+	if out, err := exec.Command(bin, "index", proj, "--auto").CombinedOutput(); err != nil {
+		t.Fatalf("index: %v\n%s", err, out)
+	}
+
+	// A port held by a process that is not an embedding endpoint.
+	hog, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hog.Close()
+	go func() {
+		for {
+			c, cerr := hog.Accept()
+			if cerr != nil {
+				return
+			}
+			_ = c.Close()
+		}
+	}()
+
+	for name, env := range map[string][]string{
+		"port held": {
+			"LEANKG_EMBED_SIDECAR_PORT=" + strconv.Itoa(hog.Addr().(*net.TCPAddr).Port),
+			"LEANKG_EMBED_SIDECAR_ARGS=-m unused.gguf --embeddings",
+		},
+		"no sidecar binary": {
+			"LEANKG_EMBED_SIDECAR_CMD=leankg-no-such-sidecar-binary",
+			"LEANKG_EMBED_SIDECAR_ARGS=-m unused.gguf --embeddings",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			l, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			addr := l.Addr().String()
+			_ = l.Close()
+			cmd := exec.Command(bin, "serve", "--http", addr, "--project", proj, "--embed-provider", "local")
+			// The server must face the sidecar under test, not the operator's:
+			// an inherited LEANKG_EMBED_BASE_URL would attach it to a running
+			// sidecar and the failure under test would never happen. An empty
+			// value and an absent value are equivalent for every embed reader.
+			cmd.Env = append(append(os.Environ(),
+				"LEANKG_EMBED_BASE_URL=",
+				"LEANKG_EMBED_MODEL=",
+			), env...)
+			var logs strings.Builder
+			cmd.Stdout, cmd.Stderr = &logs, &logs
+			if err := cmd.Start(); err != nil {
+				t.Fatalf("serve: %v", err)
+			}
+			defer func() {
+				_ = cmd.Process.Kill()
+				_, _ = cmd.Process.Wait()
+			}()
+			code := 0
+			deadline := time.Now().Add(30 * time.Second)
+			for time.Now().Before(deadline) && code != 200 {
+				resp, gerr := http.Get("http://" + addr + "/health")
+				if gerr == nil {
+					_ = resp.Body.Close()
+					code = resp.StatusCode
+				}
+				if code != 200 {
+					time.Sleep(100 * time.Millisecond)
+				}
+			}
+			if code != 200 {
+				t.Fatalf("GET /health = %d after 30s; the server must bind without a query embedder.\noutput:\n%s", code, logs.String())
+			}
+			// The degradation is reported, not swallowed.
+			if !strings.Contains(logs.String(), "embed provider unavailable") {
+				t.Fatalf("missing the degrade notice; output:\n%s", logs.String())
+			}
+		})
+	}
+}
+
+// TestUIV2LegacyRoutesServeData is the FR-GO-DASH acceptance criterion: every
+// one of the 11 legacy /api/* routes the ui-v2 SPA calls must answer REAL DATA
+// on the --ui listener, not the SPA fallback's index.html. The tracker row has
+// said "TODO — the SPA fallback answers those calls with index.html" since
+// 2026-09-11; measured live on 2026-10-11 all 11 return data, so this guard
+// turns a stale claim into either a passing fact or a build failure.
+func TestUIV2LegacyRoutesServeData(t *testing.T) {
+	bin := buildLeanKG(t)
+	proj := seedProject(t)
+	if out, err := exec.Command(bin, "index", proj, "--auto").CombinedOutput(); err != nil {
+		t.Fatalf("index: %v\n%s", err, out)
+	}
+
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := l.Addr().String()
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(bin, "serve", "--read-only", "--ui", addr, "--project", proj)
+	cmd.Stdout, cmd.Stderr = io.Discard, io.Discard
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("serve: %v", err)
+	}
+	defer func() {
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+	}()
+
+	get := func(path string) (int, string, string) {
+		t.Helper()
+		resp, err := http.Get("http://" + addr + path)
+		if err != nil {
+			return 0, "", ""
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, resp.Header.Get("Content-Type"), string(b)
+	}
+	post := func(path, body string) (int, string, string) {
+		t.Helper()
+		resp, err := http.Post("http://"+addr+path, "application/json", strings.NewReader(body))
+		if err != nil {
+			return 0, "", ""
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, resp.Header.Get("Content-Type"), string(b)
+	}
+
+	for deadline := time.Now().Add(20 * time.Second); ; {
+		code, _, _ := get("/health")
+		if code == 200 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	for _, tc := range []struct {
+		method, path, body string
+		want               int
+	}{
+		{"GET", "/api/index/status", "", 200},
+		{"GET", "/api/search?q=Handle", "", 200},
+		{"POST", "/api/query", `{"query":"Handle"}`, 200},
+		{"POST", "/api/query-graph", `{"question":"what exists"}`, 200},
+		{"GET", "/api/file?path=demo.go", "", 200},
+		{"GET", "/api/graph/children?node=Handle", "", 200},
+		{"GET", "/api/graph/clusters", "", 200},
+		{"GET", "/api/graph/report", "", 200},
+		{"GET", "/api/graph/service-topology", "", 200},
+	} {
+		var code int
+		var ctype, body string
+		if tc.method == "POST" {
+			code, ctype, body = post(tc.path, tc.body)
+		} else {
+			code, ctype, body = get(tc.path)
+		}
+		if code != tc.want {
+			t.Errorf("%s %s: %d (want %d) body=%s", tc.method, tc.path, code, tc.want, body)
+			continue
+		}
+		// The defect the row names: the SPA fallback would answer 200 text/html
+		// with the shell, so a 200 alone proves nothing.
+		if !strings.Contains(ctype, "json") {
+			t.Errorf("%s %s: content-type %q — the SPA fallback answered, not the data API", tc.method, tc.path, ctype)
+		}
+	}
+
+	// The shell and its assets still come from the embedded build.
+	if code, ctype, body := get("/"); code != 200 || !strings.Contains(ctype, "text/html") || !strings.Contains(body, `id="root"`) {
+		t.Errorf("GET /: %d %s (embedded ui-v2 shell not served)", code, ctype)
+	}
+	if code, ctype, _ := get("/favicon.svg"); code != 200 || !strings.Contains(ctype, "svg") {
+		t.Errorf("GET /favicon.svg: %d %s", code, ctype)
+	}
+}
