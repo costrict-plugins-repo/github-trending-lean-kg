@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="LeanKG">
+  <!-- Favicon cut of assets/icon.svg: flat high-contrast strokes, no hub disc.
+       At 16px the gradient's dark end and the junction disc both turn to mud. -->
+  <rect width="64" height="64" rx="14" fill="#0b1220"/>
+  <g stroke="#67e8f9" stroke-width="8.5" stroke-linecap="round" fill="none">
+    <path d="M21 12V52"/>
+    <path d="M21 32L45 13"/>
+    <path d="M21 32L45 51"/>
+  </g>
+  <g fill="#fbbf24">
+    <circle cx="45" cy="13" r="6.5"/>
+    <circle cx="45" cy="51" r="6.5"/>
+  </g>
+</svg>

@@ -1,0 +1,903 @@
+package store
+
+import (
+	"database/sql"
+	"encoding/binary"
+	"encoding/json"
+	"fmt"
+	"math"
+	"strings"
+	"time"
+)
+
+// ModelStamp pins a vector collection to one embedding model. Ported from
+// FR-ZCP-11 (issue #279): dimension-only checks are insufficient; the full
+// stamp must match or the query side degrades to L2 and writers hard-fail.
+//
+// ChunkerVersion couples the collection to the text-blob construction
+// pipeline: a blob-logic change invalidates every content hash, so it must
+// invalidate the collection the same way a revision change does. QueryPrefix
+// and DocumentPrefix record the asymmetric-model prefixes the vectors were
+// built with — a prefix change re-embeds into a different vector space, so a
+// query embedded with a different prefix must never match this collection.
+type ModelStamp struct {
+	ModelID        string `json:"model_id"`
+	Revision       string `json:"revision"`
+	Dimensions     int    `json:"dimensions"`
+	Distance       string `json:"distance"` // cosine
+	Provider       string `json:"provider"`
+	ChunkerVersion int    `json:"chunker_version"`
+	QueryPrefix    string `json:"query_prefix"`
+	DocumentPrefix string `json:"document_prefix"`
+	// TextCap is the per-text rune cap the vectors were written with (0 =
+	// not recorded). Provenance only: it is not part of Matches.
+	TextCap int `json:"text_cap"`
+}
+
+// VectorRow is one vector to persist: qualified name plus float32 components.
+type VectorRow struct {
+	QualifiedName string
+	Vec           []float32
+}
+
+// StaleStampSweep reports what a stale-collection purge removed.
+type StaleStampSweep struct {
+	// Models is the number of vector collections dropped.
+	Models int `json:"models"`
+	// Vectors is the number of vector rows dropped.
+	Vectors int `json:"vectors"`
+	// State is the number of embedding-state rows dropped.
+	State int `json:"state"`
+}
+
+// Empty reports whether the sweep removed nothing.
+func (s StaleStampSweep) Empty() bool {
+	return s.Models == 0 && s.Vectors == 0 && s.State == 0
+}
+
+// Matches reports whether two stamps describe the same vector space: model id,
+// revision, dimensions, distance, chunker version and the query/document
+// prefix pair. Provider is excluded from that identity (a transport label, so
+// an HF-imported collection stamped "openai" is read back by a "local" provider
+// without drift), but it is not inert: internal/embed picks the per-text rune
+// cap from the label. Matches ignores TextCap: the write cap is resolved once
+// per run by resolveWriteCap (stored cap, else label/budget rule, else pin, else
+// error), and the stored TextCap is what that resolver reads back.
+func (a ModelStamp) Matches(b ModelStamp) bool {
+	return a.ModelID == b.ModelID &&
+		a.Revision == b.Revision &&
+		a.Dimensions == b.Dimensions &&
+		a.Distance == b.Distance &&
+		a.ChunkerVersion == b.ChunkerVersion &&
+		a.QueryPrefix == b.QueryPrefix &&
+		a.DocumentPrefix == b.DocumentPrefix
+}
+
+// stampOptionalCols are the emb_stamp columns that a LATER migration added:
+// the collection identity trio (chunker_version, query_prefix,
+// document_prefix — migration 015) and the per-text cap (text_cap —
+// migration 017). A store that has not run that migration has no such
+// column, and naming a missing column in a statement fails the WHOLE
+// statement ("no such column: text_cap") — which is how a pre-017 store
+// made the L3 rung report a missing collection for a collection that holds
+// thousands of vectors. Each optional column therefore carries a documented
+// default (0 = "never recorded" / "unversioned", "" = "no prefix"), and a
+// store missing the column reads and writes that default.
+var stampOptionalCols = []struct {
+	name string
+	def  string // the documented default, projected when the column is absent
+	val  func(ModelStamp) any
+}{
+	{name: "chunker_version", def: "0", val: func(st ModelStamp) any { return st.ChunkerVersion }},
+	{name: "query_prefix", def: "''", val: func(st ModelStamp) any { return st.QueryPrefix }},
+	{name: "document_prefix", def: "''", val: func(st ModelStamp) any { return st.DocumentPrefix }},
+	{name: "text_cap", def: "0", val: func(st ModelStamp) any { return st.TextCap }},
+}
+
+// stampColumnSet is the set of emb_stamp columns a store's schema carries.
+type stampColumnSet map[string]bool
+
+// stampSelectFor builds the emb_stamp read shape for the columns a store
+// actually has: the identity columns always, plus the optional ones the
+// schema carries. An optional column the store lacks is projected as its
+// documented default, so the row shape — and the scan behind it — never
+// changes with the schema version.
+func stampSelectFor(cols stampColumnSet) string {
+	sel := []string{"model_id", "revision", "dimensions", "distance", "provider"}
+	for _, c := range stampOptionalCols {
+		if cols[c.name] {
+			sel = append(sel, "COALESCE("+c.name+", "+c.def+")")
+			continue
+		}
+		sel = append(sel, c.def)
+	}
+	return "SELECT " + strings.Join(sel, ", ") + " FROM emb_stamp"
+}
+
+// stampUpsertFor builds the emb_stamp upsert for the columns a store
+// actually has. The identity columns are always written; an optional column
+// the store lacks is left out of the statement AND of the ON CONFLICT
+// update, so a pre-017 store stays writable and its stamp reads back the
+// documented default for the column it does not have.
+func stampUpsertFor(cols stampColumnSet, placeholder func(int) string) string {
+	names := []string{"model_id", "revision", "dimensions", "distance", "provider"}
+	for _, c := range stampOptionalCols {
+		if cols[c.name] {
+			names = append(names, c.name)
+		}
+	}
+	ph := make([]string, len(names))
+	for i := range names {
+		ph[i] = placeholder(i + 1)
+	}
+	sets := make([]string, 0, len(names)-1)
+	for _, n := range names[1:] {
+		sets = append(sets, n+"=excluded."+n)
+	}
+	return "INSERT INTO emb_stamp (" + strings.Join(names, ", ") + ") VALUES (" +
+		strings.Join(ph, ", ") + ") ON CONFLICT(model_id) DO UPDATE SET " + strings.Join(sets, ", ")
+}
+
+// stampValues returns the stamp values in the column order stampUpsertFor
+// writes: the identity columns, then the optional ones the store carries.
+func stampValues(st ModelStamp, cols stampColumnSet) []any {
+	vals := []any{st.ModelID, st.Revision, st.Dimensions, st.Distance, st.Provider}
+	for _, c := range stampOptionalCols {
+		if cols[c.name] {
+			vals = append(vals, c.val(st))
+		}
+	}
+	return vals
+}
+
+// stampShape is the read/write shape of emb_stamp for one store: the
+// columns its schema carries and the SELECT built from them.
+//
+// It is NOT cached across calls: the shape changes when a migration runs,
+// and a server that opened the store before the writer migrated it would
+// otherwise keep reading through the older shape. The probe is one catalog
+// query, cheap next to the vector scan that follows it.
+type stampShape struct {
+	cols      stampColumnSet
+	selectSQL string
+}
+
+// WriteStamp upserts the stamp for a model (writer side, after validation).
+// The full identity — model, revision, dims, distance, provider, chunker
+// version and the query/document prefix pair — is what a reader compares, so
+// every component is persisted.
+func (s *Store) WriteStamp(st ModelStamp) error {
+	shape, err := s.stampShape()
+	if err != nil {
+		return fmt.Errorf("store: stamp shape: %w", err)
+	}
+	if _, err := s.db.Exec(stampUpsertFor(shape.cols, func(int) string { return "?" }), stampValues(st, shape.cols)...); err != nil {
+		return fmt.Errorf("store: write stamp %s: %w", st.ModelID, err)
+	}
+	return s.BumpWatermark()
+}
+
+// stampColumns probes the emb_stamp columns this store's schema carries.
+// A store that never had the table (or that predates the stamp migrations)
+// yields no optional columns; the read then fails with the driver's own
+// "no such table: emb_stamp", which is the truth about that store.
+func (s *Store) stampColumns() (stampColumnSet, error) {
+	rows, err := s.db.Query(`SELECT name FROM pragma_table_info('emb_stamp')`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	cols := stampColumnSet{}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		cols[name] = true
+	}
+	return cols, rows.Err()
+}
+
+// stampShape probes this store's emb_stamp columns and builds the read
+// shape from them.
+func (s *Store) stampShape() (*stampShape, error) {
+	cols, err := s.stampColumns()
+	if err != nil {
+		return nil, err
+	}
+	return &stampShape{cols: cols, selectSQL: stampSelectFor(cols)}, nil
+}
+
+// Stamp returns the persisted stamp for a model; nil when none exists.
+// The read is shaped by the columns the store's schema actually has: the
+// optional ones (chunker_version/prefixes/text_cap) are read through COALESCE
+// so a row written before they existed still yields a usable stamp (chunker
+// 0 = "unversioned", which every writer treats as a mismatch demanding a
+// rebuild), and a column the schema does not have AT ALL is projected as its
+// documented default (text_cap 0 = "cap never recorded") instead of failing
+// the read with "no such column".
+func (s *Store) Stamp(modelID string) (*ModelStamp, error) {
+	shape, err := s.stampShape()
+	if err != nil {
+		return nil, err
+	}
+	var st ModelStamp
+	err = s.db.QueryRow(shape.selectSQL+` WHERE model_id = ?`, modelID).
+		Scan(&st.ModelID, &st.Revision, &st.Dimensions, &st.Distance, &st.Provider,
+			&st.ChunkerVersion, &st.QueryPrefix, &st.DocumentPrefix, &st.TextCap)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &st, nil
+}
+
+// EmbeddingStateMap returns qualified_name -> content_hash for a model.
+func (s *Store) EmbeddingStateMap(modelID string) (map[string]string, error) {
+	rows, err := s.db.Query(`SELECT qualified_name, content_hash FROM embedding_state WHERE model_id = ?`, modelID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]string{}
+	for rows.Next() {
+		var qn, h string
+		if err := rows.Scan(&qn, &h); err != nil {
+			return nil, err
+		}
+		out[qn] = h
+	}
+	return out, rows.Err()
+}
+
+// SetEmbeddingStates records embedding_state rows for freshly embedded QNs.
+func (s *Store) SetEmbeddingStates(modelID string, states map[string]string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	for qn, h := range states {
+		if _, err := tx.Exec(`INSERT INTO embedding_state (model_id, qualified_name, content_hash, state, embedded_at)
+			VALUES (?,?,?,'embedded',strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+			ON CONFLICT(model_id, qualified_name) DO UPDATE SET content_hash=excluded.content_hash,
+				state='embedded', embedded_at=excluded.embedded_at`, modelID, qn, h); err != nil {
+			return fmt.Errorf("store: set embedding state %s: %w", qn, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	return s.BumpWatermark()
+}
+
+// Stamps returns all persisted model stamps. The read shape follows the
+// store's schema exactly like Store.Stamp's.
+func (s *Store) Stamps() ([]ModelStamp, error) {
+	shape, err := s.stampShape()
+	if err != nil {
+		return nil, err
+	}
+	rows, err := s.db.Query(shape.selectSQL)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ModelStamp
+	for rows.Next() {
+		var st ModelStamp
+		if err := rows.Scan(&st.ModelID, &st.Revision, &st.Dimensions, &st.Distance, &st.Provider,
+			&st.ChunkerVersion, &st.QueryPrefix, &st.DocumentPrefix, &st.TextCap); err != nil {
+			return nil, err
+		}
+		out = append(out, st)
+	}
+	return out, rows.Err()
+}
+
+// ReplaceFileVectors atomically replaces one file's embedding rows for a
+// model: the vectors of the qualified names in `rows` are deleted and
+// re-inserted together with their embedding_state rows, in ONE transaction.
+// That is the per-file atomic unit of issue #279 — the Rust reference commits
+// vectors + state per write call (its `import_relations` is a single
+// transaction per call, build.rs:1686), and the Go engine narrows that unit to
+// one file so a crash mid-embed can never leave half a file's vectors, nor a
+// vector without the state row that proves which content produced it.
+// (SQLite gives this durability through the WAL commit rather than
+// tmp+fsync+rename because the rows live in the database file, which is the
+// same atomic-replace boundary the reference relies on.)
+//
+// Callers pass a file's complete vector set; an empty set is a caller bug.
+func (s *Store) ReplaceFileVectors(modelID string, rows []VectorRow, states map[string]string) error {
+	if len(rows) == 0 {
+		return fmt.Errorf("store: ReplaceFileVectors %s: no vectors", modelID)
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	for _, r := range rows {
+		if _, err := tx.Exec(`DELETE FROM embedding_vectors WHERE model_id = ? AND qualified_name = ?`, modelID, r.QualifiedName); err != nil {
+			return fmt.Errorf("store: replace vector %s: %w", r.QualifiedName, err)
+		}
+		if _, err := tx.Exec(`INSERT INTO embedding_vectors (model_id, qualified_name, vec) VALUES (?,?,?)`,
+			modelID, r.QualifiedName, encodeVec(r.Vec)); err != nil {
+			return fmt.Errorf("store: replace vector %s: %w", r.QualifiedName, err)
+		}
+	}
+	for qn, h := range states {
+		if _, err := tx.Exec(`INSERT INTO embedding_state (model_id, qualified_name, content_hash, state, embedded_at)
+			VALUES (?,?,?,'embedded',strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+			ON CONFLICT(model_id, qualified_name) DO UPDATE SET content_hash=excluded.content_hash,
+				state='embedded', embedded_at=excluded.embedded_at`, modelID, qn, h); err != nil {
+			return fmt.Errorf("store: replace embedding state %s: %w", qn, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	return s.BumpWatermark()
+}
+
+// UpsertVectors writes a batch of vectors for a model in ONE transaction:
+// a crash mid-run leaves the previous state consistent and reruns resume
+// (issue #368 AC: batch upsert semantics). The embed pipeline's live path is
+// the per-file ReplaceFileVectors; UpsertVectors stays for batch-style
+// callers (NDJSON import) and direct vector injection.
+func (s *Store) UpsertVectors(modelID string, rows []VectorRow) error {
+	if len(rows) == 0 {
+		return nil
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	for _, r := range rows {
+		if _, err := tx.Exec(`INSERT INTO embedding_vectors (model_id, qualified_name, vec) VALUES (?,?,?)
+			ON CONFLICT(model_id, qualified_name) DO UPDATE SET vec=excluded.vec`,
+			modelID, r.QualifiedName, encodeVec(r.Vec)); err != nil {
+			return fmt.Errorf("store: upsert vector %s: %w", r.QualifiedName, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	return s.BumpWatermark()
+}
+
+// ClearVectors drops all vectors + state for a model (stamp-guard rebuild).
+func (s *Store) ClearVectors(modelID string) error {
+	for _, stmt := range []string{
+		`DELETE FROM embedding_vectors WHERE model_id = ?`,
+		`DELETE FROM embedding_state WHERE model_id = ?`,
+	} {
+		if _, err := s.db.Exec(stmt, modelID); err != nil {
+			return err
+		}
+	}
+	return s.BumpWatermark()
+}
+
+// DeleteOrphanVectors removes vector + state rows for elements that no
+// longer exist, every model at once — the anti-join VectorCoverage reports,
+// made repairable (gc). The watermark bumps only when rows actually go.
+func (s *Store) DeleteOrphanVectors() (int, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	vres, err := tx.Exec(`DELETE FROM embedding_vectors
+		WHERE qualified_name NOT IN (SELECT qualified_name FROM code_elements)`)
+	if err != nil {
+		return 0, err
+	}
+	nv, err := vres.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	sres, err := tx.Exec(`DELETE FROM embedding_state
+		WHERE qualified_name NOT IN (SELECT qualified_name FROM code_elements)`)
+	if err != nil {
+		return 0, err
+	}
+	ns, err := sres.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	if nv == 0 && ns == 0 {
+		return 0, nil // rollback via defer: a no-op purges nothing, not even the watermark
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return int(nv), s.BumpWatermark()
+}
+
+// VectorCount returns the vector count for a model.
+func (s *Store) VectorCount(modelID string) (int, error) {
+	var n int
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM embedding_vectors WHERE model_id = ?`, modelID).Scan(&n)
+	return n, err
+}
+
+// DeleteStaleStamps drops every vector collection that is not in keep.
+//
+// The SQLite layout keeps every collection's rows in one shared table, keyed
+// by model_id, so the purge is three DELETEs against a NOT IN list. The stamp
+// row goes with them: a stamp without vectors is a collection the L3 rung
+// would select and then find empty.
+//
+// An empty keep is a NO-OP (see the Backend contract): the caller that does
+// not know which collection is live must not be able to delete it. The
+// watermark bumps only when rows actually go, like every other purge here.
+func (s *Store) DeleteStaleStamps(keep []string) (StaleStampSweep, error) {
+	keep = cleanModelIDs(keep)
+	if len(keep) == 0 {
+		return StaleStampSweep{}, nil
+	}
+	ph := make([]string, len(keep))
+	args := make([]any, len(keep))
+	for i, k := range keep {
+		ph[i] = "?"
+		args[i] = k
+	}
+	in := strings.Join(ph, ",")
+
+	// A store whose keep collection is ABSENT is not stale — it is BEHIND.
+	// Its only collection is under some other model id: the project was
+	// embedded before the model changed, or the offsite path wrote a
+	// different id, or the embedder is mid-migration. Dropping that
+	// collection destroys embed work for no gain — the vectors ARE the
+	// store's searchable content, and the operator needs them (or a
+	// re-embed) either way. The L3 rung for such a project already
+	// degrades to L2, which is a truth about the store, not a licence to
+	// delete it.
+	var have int
+	err := s.db.QueryRow(`SELECT 1 FROM embedding_vectors WHERE model_id IN (`+in+`) LIMIT 1`, args...).Scan(&have)
+	if err != nil && err != sql.ErrNoRows {
+		return StaleStampSweep{}, err
+	}
+	if have == 0 {
+		return StaleStampSweep{}, nil
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return StaleStampSweep{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	vres, err := tx.Exec(`DELETE FROM embedding_vectors WHERE model_id NOT IN (`+in+`)`, args...)
+	if err != nil {
+		return StaleStampSweep{}, err
+	}
+	nv, err := vres.RowsAffected()
+	if err != nil {
+		return StaleStampSweep{}, err
+	}
+	sres, err := tx.Exec(`DELETE FROM embedding_state WHERE model_id NOT IN (`+in+`)`, args...)
+	if err != nil {
+		return StaleStampSweep{}, err
+	}
+	ns, err := sres.RowsAffected()
+	if err != nil {
+		return StaleStampSweep{}, err
+	}
+	mres, err := tx.Exec(`DELETE FROM emb_stamp WHERE model_id NOT IN (`+in+`)`, args...)
+	if err != nil {
+		return StaleStampSweep{}, err
+	}
+	nm, err := mres.RowsAffected()
+	if err != nil {
+		return StaleStampSweep{}, err
+	}
+	if nv == 0 && ns == 0 && nm == 0 {
+		return StaleStampSweep{}, nil // rollback via defer: a no-op purges nothing, not even the watermark
+	}
+	if err := tx.Commit(); err != nil {
+		return StaleStampSweep{}, err
+	}
+	out := StaleStampSweep{Models: int(nm), Vectors: int(nv), State: int(ns)}
+	return out, s.BumpWatermark()
+}
+
+// cleanModelIDs normalizes a keep list: empty entries dropped, duplicates
+// collapsed, order preserved. A keep list of only empty strings is as empty
+// as no keep list at all, which is why the emptiness check runs AFTER this.
+func cleanModelIDs(ids []string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(ids))
+	for _, id := range ids {
+		id = strings.TrimSpace(id)
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		out = append(out, id)
+	}
+	return out
+}
+
+// VectorSearchHit is one L3 hit with cosine similarity.
+type VectorSearchHit struct {
+	Element    Element
+	Similarity float64
+}
+
+// vectorSelectCols hydrates L3 hits. The join is INNER (RS-05): a vector
+// whose element is gone is an orphan by the store's own definition
+// (DeleteOrphanVectors) — nothing writes vectors for non-elements and the
+// NDJSON import skips dead QNs — so a LEFT JOIN served only ghosts of deleted
+// code, ranked first for their own queries, until `leankg gc`.
+const vectorSelectCols = `embedding_vectors.qualified_name,
+	COALESCE(ce.element_type,''), COALESCE(ce.name, embedding_vectors.qualified_name),
+	COALESCE(ce.file_path,''), COALESCE(ce.line_start,0), COALESCE(ce.line_end,0),
+	COALESCE(ce.language,''), COALESCE(ce.parent_qualified,''), COALESCE(ce.content,''),
+	COALESCE(ce.metadata,'{}')`
+
+// SearchVectors performs the single ANN-equivalent shape: in-process cosine
+// over the model's vectors, hydrated against code_elements.
+// ponytail: O(n) scan per query — fine to ~100k vectors at 384 dims (~0.15s
+// on M2 Pro); upgrade path is sqlite-vec when scale demands it.
+func (s *Store) SearchVectors(modelID string, q []float32, k int) ([]VectorSearchHit, error) {
+	return s.SearchVectorsScoped(modelID, q, k, nil)
+}
+
+// SearchVectorsScoped is SearchVectors over the caller's own population: keep
+// admits a row into the ranking. A nil keep means the whole corpus, so the
+// default is byte-for-byte what it was.
+//
+// The primitive exists because of a measured corpus, not a hunch: on this
+// repository's own store 22% of the elements are test fixtures and 37% are
+// archived docs, so 60% of the vector population is a document a working
+// engineer is not asking about — and a bare-symbol query ranks those documents
+// above the function. Both fusion arms rank over the same set, so no weight
+// pair closes the gap; scoping the SET is the only lever, and it is the
+// caller's decision.
+//
+// ponytail: the predicate runs inside the O(n) scan this arm already does, so
+// it costs one call per row and adds no second pass. The PostgreSQL arm cannot
+// push a Go predicate into its HNSW SQL (see pg_fts.go), which is why the
+// scope is a caller-side decision rather than a WHERE clause.
+func (s *Store) SearchVectorsScoped(modelID string, q []float32, k int, keep func(Element) bool) ([]VectorSearchHit, error) {
+	if len(q) == 0 {
+		return nil, nil
+	}
+	rows, err := s.db.Query(`SELECT `+vectorSelectCols+`, embedding_vectors.vec
+		FROM embedding_vectors JOIN code_elements ce ON ce.qualified_name = embedding_vectors.qualified_name
+		WHERE embedding_vectors.model_id = ?`, modelID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	type scored struct {
+		el  Element
+		val float64
+	}
+	var hits []scored
+	var buf []byte
+	for rows.Next() {
+		var el Element
+		var meta string
+		buf = buf[:0]
+		if err := rows.Scan(&el.QualifiedName, &el.ElementType, &el.Name, &el.FilePath, &el.LineStart, &el.LineEnd,
+			&el.Language, &el.ParentQualified, &el.Content, &meta, &buf); err != nil {
+			return nil, err
+		}
+		if meta != "" && meta != "{}" {
+			_ = json.Unmarshal([]byte(meta), &el.Metadata)
+		}
+		v := decodeVec(buf)
+		if len(v) != len(q) {
+			continue // stamped collection mismatch should never reach here; skip defensively
+		}
+		if keep != nil && !keep(el) {
+			continue // outside the caller's population: never ranked at all
+		}
+		hits = append(hits, scored{el: el, val: cosine(q, v)})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	// partial sort top-k (k is small; n scan already done)
+	for i := 0; i < len(hits) && i < k; i++ {
+		best := i
+		for j := i + 1; j < len(hits); j++ {
+			if hits[j].val > hits[best].val {
+				best = j
+			}
+		}
+		hits[i], hits[best] = hits[best], hits[i]
+	}
+	if len(hits) > k {
+		hits = hits[:k]
+	}
+	out := make([]VectorSearchHit, len(hits))
+	for i, h := range hits {
+		out[i] = VectorSearchHit{Element: h.el, Similarity: h.val}
+	}
+	return out, nil
+}
+
+func encodeVec(v []float32) []byte {
+	b := make([]byte, 4*len(v))
+	for i, f := range v {
+		binary.LittleEndian.PutUint32(b[i*4:], math.Float32bits(f))
+	}
+	return b
+}
+
+func decodeVec(b []byte) []float32 {
+	if len(b)%4 != 0 {
+		return nil
+	}
+	v := make([]float32, len(b)/4)
+	for i := range v {
+		v[i] = math.Float32frombits(binary.LittleEndian.Uint32(b[i*4:]))
+	}
+	return v
+}
+
+func cosine(a, b []float32) float64 {
+	var dot, na, nb float64
+	for i := range a {
+		dot += float64(a[i]) * float64(b[i])
+		na += float64(a[i]) * float64(a[i])
+		nb += float64(b[i]) * float64(b[i])
+	}
+	if na == 0 || nb == 0 {
+		return 0
+	}
+	return dot / (math.Sqrt(na) * math.Sqrt(nb))
+}
+
+// Watermark returns the current freshness sequence number.
+func (s *Store) Watermark() (int64, int64, error) {
+	var seq, at int64
+	err := s.db.QueryRow(`SELECT seq, at FROM write_watermark WHERE id = 1`).Scan(&seq, &at)
+	return seq, at, err
+}
+
+// BumpWatermark advances the freshness sequence (one call per commit batch).
+func (s *Store) BumpWatermark() error {
+	if s.mode == RO {
+		return nil // readers never bump
+	}
+	_, err := s.db.Exec(`UPDATE write_watermark SET seq = seq + 1, at = ? WHERE id = 1`, time.Now().Unix())
+	return err
+}
+
+// Inventory is the index summary surfaced by the status tool.
+type Inventory struct {
+	TotalElements      int            `json:"total_elements"`
+	TotalFiles         int            `json:"total_files"`
+	TotalRelationships int            `json:"total_relationships"`
+	TotalVectors       int            `json:"total_vectors"`
+	ElementsByType     map[string]int `json:"elements_by_type"`
+	// LastInventorySeq is the watermark seq at inventory-compute time; readers
+	// compare it against Watermark() to derive fresh | possibly_stale.
+	LastInventorySeq int64 `json:"last_inventory_seq"`
+	ComputedAt       int64 `json:"computed_at"`
+}
+
+// SaveInventory persists the inventory under kv with the current watermark.
+func (s *Store) SaveInventory(inv Inventory) error {
+	seq, _, err := s.Watermark()
+	if err != nil {
+		return err
+	}
+	inv.LastInventorySeq = seq
+	inv.ComputedAt = time.Now().Unix()
+	b, err := json.Marshal(inv)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.Exec(`INSERT INTO kv (key, value) VALUES ('inventory', ?)
+		ON CONFLICT(key) DO UPDATE SET value=excluded.value`, string(b))
+	return err
+}
+
+// LoadInventory returns the persisted inventory; nil when never computed.
+func (s *Store) LoadInventory() (*Inventory, error) {
+	var val string
+	err := s.db.QueryRow(`SELECT value FROM kv WHERE key = 'inventory'`).Scan(&val)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var inv Inventory
+	if err := json.Unmarshal([]byte(val), &inv); err != nil {
+		return nil, err
+	}
+	return &inv, nil
+}
+
+// EmbedRun is one recorded leankg-embed run (read by the status tool).
+type EmbedRun struct {
+	ID          int64   `json:"id"`
+	ModelID     string  `json:"model_id"`
+	Mode        string  `json:"mode"`
+	StartedAt   string  `json:"started_at"`
+	FinishedAt  *string `json:"finished_at"`
+	Dirty       int     `json:"dirty"`
+	Embedded    int     `json:"embedded"`
+	Skipped     int     `json:"skipped"`
+	Failed      int     `json:"failed"`
+	Truncations int     `json:"truncations"`
+	Orphans     int     `json:"orphans"`
+	Status      string  `json:"status"`
+}
+
+// StartEmbedRun records a running pipeline run and returns its id.
+func (s *Store) StartEmbedRun(modelID, mode string, dirty int) (int64, error) {
+	res, err := s.db.Exec(`INSERT INTO embed_runs (model_id, mode, started_at, dirty, status) VALUES (?,?,strftime('%Y-%m-%dT%H:%M:%fZ','now'),?,'running')`, modelID, mode, dirty)
+	if err != nil {
+		return 0, err
+	}
+	return res.LastInsertId()
+}
+
+// FinishEmbedRun closes a run record with the final counters.
+func (s *Store) FinishEmbedRun(id int64, status string, embedded, skipped, failed, truncations, orphans int) error {
+	_, err := s.db.Exec(`UPDATE embed_runs SET finished_at=strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+		embedded=?, skipped=?, failed=?, truncations=?, orphans=?, status=? WHERE id=?`,
+		embedded, skipped, failed, truncations, orphans, status, id)
+	return err
+}
+
+// EmbedRunPrune reports what one prune of the embed-run ledger removed.
+type EmbedRunPrune struct {
+	// Pruned is the number of finished run rows deleted (older than the
+	// cutoff).
+	Pruned int64 `json:"pruned"`
+	// Closed is the number of rows that were still marked "running" past
+	// the cutoff and were closed out instead of deleted.
+	Closed int64 `json:"closed"`
+}
+
+// embedRunCutoff renders the cutoff in the ledger's own timestamp format
+// (started_at is written as strftime('%Y-%m-%dT%H:%M:%fZ','now') on SQLite
+// and as the same shape on PostgreSQL), so the comparison is a plain string
+// comparison on both engines.
+func embedRunCutoff(cutoff time.Time) string {
+	return cutoff.UTC().Format("2006-01-02T15:04:05.000Z")
+}
+
+// PruneEmbedRuns trims the embed-run ledger: it closes out the runs that were
+// still marked "running" when they should have finished, and deletes the
+// finished runs older than the cutoff.
+//
+// The ledger was append-only: every `leankg-embed run` appended a row and
+// nothing ever removed one, so a long-lived store accumulated one row per run
+// forever — and a run that was killed mid-flight stayed in state "running"
+// forever, which is what `status` then reported as the last embed run.
+//
+// The newest row is never deleted: it names the store's current collection
+// (CurrentModelID), and the stale-collection sweep derives its keep set from
+// it. A row that is still "running" is closed out, not deleted, so the
+// history of the interrupted run survives.
+func (s *Store) PruneEmbedRuns(cutoff time.Time) (EmbedRunPrune, error) {
+	var out EmbedRunPrune
+	cut := embedRunCutoff(cutoff)
+	res, err := s.db.Exec(`UPDATE embed_runs SET status='failed', finished_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+		WHERE status='running' AND started_at < ?`, cut)
+	if err != nil {
+		return out, fmt.Errorf("store: close out stale embed runs: %w", err)
+	}
+	if n, err := res.RowsAffected(); err == nil {
+		out.Closed = n
+	}
+	res, err = s.db.Exec(`DELETE FROM embed_runs
+		WHERE started_at < ? AND status <> 'running'
+		  AND id <> (SELECT COALESCE(MAX(id), 0) FROM embed_runs)`, cut)
+	if err != nil {
+		return out, fmt.Errorf("store: prune embed runs: %w", err)
+	}
+	if n, err := res.RowsAffected(); err == nil {
+		out.Pruned = n
+	}
+	return out, nil
+}
+
+// CurrentModelID reports the model id of the store's most recent embed run —
+// the collection the next embed extends and the one the L3 rung queries.
+//
+// It is derived from the run ledger rather than from the stamps, because a
+// stamp carries no timestamp: two collections can both be stamped and nothing
+// in emb_stamp says which one is live. The run ledger does, because the
+// newest run is the one that wrote last.
+//
+// An empty id means "the store has never been embedded" — the caller must
+// treat that as "the current collection is unknown", not as "no collection is
+// current".
+func CurrentModelID(st Backend) (string, error) {
+	run, err := st.LastEmbedRunAny()
+	if err != nil {
+		return "", err
+	}
+	if run == nil {
+		return "", nil
+	}
+	return strings.TrimSpace(run.ModelID), nil
+}
+
+// LastEmbedRunAny returns the most recent embed run across all models.
+func (s *Store) LastEmbedRunAny() (*EmbedRun, error) {
+	row := s.db.QueryRow(`SELECT id, model_id, mode, started_at, finished_at, dirty, embedded, skipped, failed, truncations, orphans, status
+		FROM embed_runs ORDER BY id DESC LIMIT 1`)
+	var r EmbedRun
+	err := row.Scan(&r.ID, &r.ModelID, &r.Mode, &r.StartedAt, &r.FinishedAt, &r.Dirty, &r.Embedded, &r.Skipped, &r.Failed, &r.Truncations, &r.Orphans, &r.Status)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &r, nil
+}
+
+// LastEmbedRun returns the most recent run for a model; nil when none.
+func (s *Store) LastEmbedRun(modelID string) (*EmbedRun, error) {
+	row := s.db.QueryRow(`SELECT id, model_id, mode, started_at, finished_at, dirty, embedded, skipped, failed, truncations, orphans, status
+		FROM embed_runs WHERE model_id = ? ORDER BY id DESC LIMIT 1`, modelID)
+	var r EmbedRun
+	err := row.Scan(&r.ID, &r.ModelID, &r.Mode, &r.StartedAt, &r.FinishedAt, &r.Dirty, &r.Embedded, &r.Skipped, &r.Failed, &r.Truncations, &r.Orphans, &r.Status)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &r, nil
+}
+
+// RefreshInventory recomputes the inventory snapshot from the live counts and
+// persists it with the current watermark. It is a free function over Backend
+// (not a method on either store) because every writer path needs the same
+// bookkeeping and the counts are already interface methods: an engine that
+// indexes, summarizes, or applies a federation pull must not leave readers
+// reporting possibly_stale forever.
+func RefreshInventory(st Backend) (Inventory, error) {
+	els, err := st.ElementCount()
+	if err != nil {
+		return Inventory{}, err
+	}
+	rels, err := st.RelationshipCount()
+	if err != nil {
+		return Inventory{}, err
+	}
+	files, err := st.FileCount()
+	if err != nil {
+		return Inventory{}, err
+	}
+	byType, err := st.ElementsByType()
+	if err != nil {
+		return Inventory{}, err
+	}
+	vectors := 0
+	if stamps, err := st.Stamps(); err == nil {
+		for _, ms := range stamps {
+			if n, err := st.VectorCount(ms.ModelID); err == nil {
+				vectors += n
+			}
+		}
+	}
+	inv := Inventory{
+		TotalElements:      els,
+		TotalFiles:         files,
+		TotalRelationships: rels,
+		TotalVectors:       vectors,
+		ElementsByType:     byType,
+	}
+	if err := st.SaveInventory(inv); err != nil {
+		return Inventory{}, err
+	}
+	return inv, nil
+}

@@ -1,0 +1,379 @@
+// CLI verb tests for the portfolio registry (#376). These run the verb
+// FUNCTIONS in-process (main.go's dispatch table is Main's file): the verbs
+// write to os.Stdout, so each test swaps in a pipe and asserts on the captured
+// text and the registry state the verb left behind.
+package main
+
+import (
+	"encoding/json"
+	"io"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"testing"
+
+	"github.com/FreePeak/LeanKG/internal/portfolioreg"
+	"github.com/FreePeak/LeanKG/internal/store"
+)
+
+// captureStdout runs fn with os.Stdout redirected and returns what it wrote.
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+	old := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = w
+	done := make(chan string, 1)
+	go func() {
+		b, _ := io.ReadAll(r)
+		done <- string(b)
+	}()
+	fn()
+	_ = w.Close()
+	os.Stdout = old
+	return <-done
+}
+
+// seedIndexedProject writes a real sqlite store for dir: two elements and one
+// file row, so the register verb's counts are non-trivial.
+func seedIndexedProject(t *testing.T, dir string) {
+	t.Helper()
+	st, err := store.Open(filepath.Join(dir, ".leankg", "leankg.db"), store.RW)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err := st.Migrate(); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertElements([]store.Element{
+		{QualifiedName: "pkg.Alpha", ElementType: "function", Name: "Alpha", FilePath: "a.go", Language: "go"},
+		{QualifiedName: "pkg.Beta", ElementType: "function", Name: "Beta", FilePath: "a.go", Language: "go"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertFiles([]store.FileRecord{{Path: "a.go", Size: 10, MtimeNS: 1, ContentHash: "h"}}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRegisterProjectAndProjectsVerbs(t *testing.T) {
+	registry := filepath.Join(t.TempDir(), "portfolio.db")
+	t.Setenv(portfolioreg.DBPathEnv, registry)
+	t.Setenv(portfolioreg.MaxReposEnv, "1")
+	dir := t.TempDir()
+	seedIndexedProject(t, dir)
+
+	out := captureStdout(t, func() { cmdRegisterProject([]string{dir, "--name", "api"}) })
+	if !strings.Contains(out, "registered api") || !strings.Contains(out, "elements=2 files=1") {
+		t.Fatalf("register-project output = %q", out)
+	}
+
+	// The verb wrote a real registry row: read it back through the package API
+	// rather than trusting the printed line.
+	rows, err := portfolioreg.Projects(t.Context(), portfolioreg.Options{DBPath: registry})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].Name != "api" || rows[0].ElementCount != 2 ||
+		rows[0].FileCount != 1 || rows[0].LastIndexed == nil {
+		t.Fatalf("registry row = %+v", rows)
+	}
+
+	// The manifest is T0: registry counts + on-disk presence, hot set bounded.
+	var manifest struct {
+		Count    int `json:"count"`
+		HotLimit int `json:"hot_limit"`
+		Projects []struct {
+			Project     string `json:"project"`
+			Elements    int    `json:"elements"`
+			Files       int    `json:"files"`
+			StoreOnDisk bool   `json:"store_on_disk"`
+			Hot         bool   `json:"hot"`
+		} `json:"projects"`
+	}
+	out = captureStdout(t, func() { cmdProjects([]string{"--json"}) })
+	if err := json.Unmarshal([]byte(out), &manifest); err != nil {
+		t.Fatalf("projects --json output %q: %v", out, err)
+	}
+	if manifest.Count != 1 || manifest.HotLimit != 1 || len(manifest.Projects) != 1 {
+		t.Fatalf("manifest = %+v", manifest)
+	}
+	p := manifest.Projects[0]
+	if p.Project != "api" || p.Elements != 2 || p.Files != 1 || !p.StoreOnDisk || !p.Hot {
+		t.Fatalf("manifest project = %+v", p)
+	}
+
+	// Text mode renders the same row for a human.
+	out = captureStdout(t, func() { cmdProjects(nil) })
+	for _, want := range []string{"PROJECT", "api", "on-disk"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("projects table %q missing %q", out, want)
+		}
+	}
+
+	// --forget removes the registration and says so.
+	out = captureStdout(t, func() { cmdProjects([]string{"--forget", dir}) })
+	if !strings.Contains(out, "forgot") {
+		t.Fatalf("projects --forget output = %q", out)
+	}
+	if rows, err := portfolioreg.Projects(t.Context(), portfolioreg.Options{DBPath: registry}); err != nil || len(rows) != 0 {
+		t.Fatalf("registry after forget: %+v, %v", rows, err)
+	}
+}
+
+func TestProjectsVerbWithoutRegistry(t *testing.T) {
+	t.Setenv(portfolioreg.DBPathEnv, filepath.Join(t.TempDir(), "missing.db"))
+	out := captureStdout(t, func() { cmdProjects(nil) })
+	if !strings.Contains(out, "no projects registered") {
+		t.Fatalf("projects without a registry = %q; want a plain empty listing, not an error", out)
+	}
+}
+
+func TestRegisterProjectWithoutStoreStampsNothing(t *testing.T) {
+	registry := filepath.Join(t.TempDir(), "portfolio.db")
+	t.Setenv(portfolioreg.DBPathEnv, registry)
+	dir := filepath.Join(t.TempDir(), "never-indexed")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	out := captureStdout(t, func() { cmdRegisterProject([]string{dir}) })
+	if !strings.Contains(out, "never indexed") {
+		t.Fatalf("register-project of an unindexed dir = %q", out)
+	}
+	rows, err := portfolioreg.Projects(t.Context(), portfolioreg.Options{DBPath: registry})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].LastIndexed != nil || rows[0].ElementCount != 0 {
+		t.Fatalf("unindexed registration = %+v; want no stamp and zero counts", rows)
+	}
+	if rows[0].Name != "never-indexed" {
+		t.Fatalf("name default = %q; want the directory base name", rows[0].Name)
+	}
+}
+
+// TestProjectsPruneVerb pins the CLI contract for the prune flag, end to end
+// through the verb: a dry run names the casualty and changes nothing, --apply
+// forgets it, and a project whose directory EXISTS is never touched even when
+// its store is missing (registered-but-not-yet-indexed is a normal row).
+//
+// Measured 2026-10-11: 84 of 108 registrations had deleted directories (docs/prd.md).
+func TestProjectsPruneVerb(t *testing.T) {
+	registry := filepath.Join(t.TempDir(), "portfolio.db")
+	t.Setenv(portfolioreg.DBPathEnv, registry)
+
+	live := t.TempDir()
+	never := t.TempDir() // on disk, no store: a legitimate row
+	vanished := filepath.Join(t.TempDir(), "vanished")
+	if err := os.MkdirAll(vanished, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for name, dir := range map[string]string{"live": live, "never": never, "vanished": vanished} {
+		if out := captureStdout(t, func() { cmdRegisterProject([]string{dir, "--name", name}) }); !strings.Contains(out, "registered") {
+			t.Fatalf("register %s: %s", name, out)
+		}
+	}
+	// Canonical, because Register resolves symlinks and macOS /tmp is one.
+	vanishedCanon, err := portfolioreg.Canonical(vanished)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(vanished); err != nil {
+		t.Fatal(err)
+	}
+
+	// Dry run: names the casualty, changes nothing.
+	out := captureStdout(t, func() { cmdProjects([]string{"--prune"}) })
+	if !strings.Contains(out, vanishedCanon) {
+		t.Errorf("dry run did not name %s:\n%s", vanishedCanon, out)
+	}
+	if !strings.Contains(out, "dry run") {
+		t.Errorf("dry run does not say it is one:\n%s", out)
+	}
+	dryJSON := captureStdout(t, func() { cmdProjects([]string{"--json"}) })
+	if !strings.Contains(dryJSON, `"count": 3`) && !strings.Contains(dryJSON, `"count":3`) {
+		t.Fatalf("dry run changed the registry:\n%s", dryJSON)
+	}
+
+	// Apply: forgets exactly the vanished row.
+	out = captureStdout(t, func() { cmdProjects([]string{"--prune", "--apply"}) })
+	if !strings.Contains(out, "forgot 1 registration") {
+		t.Errorf("apply output:\n%s", out)
+	}
+	after := captureStdout(t, func() { cmdProjects([]string{"--json"}) })
+	if !strings.Contains(after, `"count": 2`) && !strings.Contains(after, `"count":2`) {
+		t.Fatalf("after apply:\n%s", after)
+	}
+	// The never-indexed project is still registered: its dir exists.
+	if !strings.Contains(after, `"project": "never"`) && !strings.Contains(after, `"project":"never"`) {
+		t.Errorf("prune dropped a live-but-unindexed project:\n%s", after)
+	}
+
+	// A second apply is a no-op, not an error.
+	out = captureStdout(t, func() { cmdProjects([]string{"--prune", "--apply"}) })
+	if !strings.Contains(out, "nothing to prune") {
+		t.Errorf("second apply:\n%s", out)
+	}
+}
+
+// TestProjectsTableMarksGoneDirs pins the table column: a row whose directory
+// is gone must not read as merely "missing" store.
+func TestProjectsTableMarksGoneDirs(t *testing.T) {
+	registry := filepath.Join(t.TempDir(), "portfolio.db")
+	t.Setenv(portfolioreg.DBPathEnv, registry)
+
+	gone := filepath.Join(t.TempDir(), "gone")
+	if err := os.MkdirAll(gone, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	captureStdout(t, func() { cmdRegisterProject([]string{gone, "--name", "gone"}) })
+	if err := os.RemoveAll(gone); err != nil {
+		t.Fatal(err)
+	}
+	out := captureStdout(t, func() { cmdProjects(nil) })
+	if !strings.Contains(out, "dir-gone") {
+		t.Errorf("table does not distinguish a vanished directory from a missing store:\n%s", out)
+	}
+}
+
+// TestProjectsPruneWithoutRegistry: a single-repo deployment has no registry
+// file, and the sweep answers the way the listing does: nothing to prune, exit 0.
+func TestProjectsPruneWithoutRegistry(t *testing.T) {
+	t.Setenv(portfolioreg.DBPathEnv, filepath.Join(t.TempDir(), "missing.db"))
+	stdout, stderr, code := runCLI(t, "projects", "--prune")
+	if code != 0 || !strings.Contains(stdout, "nothing to prune") {
+		t.Fatalf("projects --prune without a registry: exit %d, stdout %q, stderr %q", code, stdout, stderr)
+	}
+	stdout, stderr, code = runCLI(t, "projects", "--prune", "--json")
+	if code != 0 || !strings.Contains(stdout, `"count": 0`) {
+		t.Fatalf("projects --prune --json without a registry: exit %d, stdout %q, stderr %q", code, stdout, stderr)
+	}
+}
+
+// TestProjectsUnreadableRegistryIsAnError: a registry file that exists but cannot
+// be stat'ed (EACCES from a locked parent) is a fault, not "no registry". Read as
+// "no registry" it printed a clean sweep and an empty listing over a registry the
+// verb never read.
+func TestProjectsUnreadableRegistryIsAnError(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions, so the stat cannot fail")
+	}
+	parent := filepath.Join(t.TempDir(), "locked")
+	if err := os.MkdirAll(parent, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	registry := filepath.Join(parent, "portfolio.db")
+	if err := os.WriteFile(registry, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(parent, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(parent, 0o755) })
+	t.Setenv(portfolioreg.DBPathEnv, registry)
+
+	stdout, stderr, code := runCLI(t, "projects", "--prune")
+	if code != 1 || strings.Contains(stdout, "nothing to prune") || !strings.Contains(stderr, "permission denied") {
+		t.Errorf("projects --prune: exit %d, stdout %q, stderr %q; want exit 1 and the stat error", code, stdout, stderr)
+	}
+	stdout, stderr, code = runCLI(t, "projects")
+	if code != 1 || strings.Contains(stdout, "no projects registered") || !strings.Contains(stderr, "permission denied") {
+		t.Errorf("projects: exit %d, stdout %q, stderr %q; want exit 1 and the stat error", code, stdout, stderr)
+	}
+}
+
+// TestProjectsPruneJSONContract pins the machine-readable shape: pruned is always
+// an array (never null), and count and applied say what the run did.
+func TestProjectsPruneJSONContract(t *testing.T) {
+	t.Setenv(portfolioreg.DBPathEnv, filepath.Join(t.TempDir(), "portfolio.db"))
+	vanished := filepath.Join(t.TempDir(), "vanished")
+	if err := os.MkdirAll(vanished, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	captureStdout(t, func() { cmdRegisterProject([]string{vanished, "--name", "vanished"}) })
+	vanishedCanon, err := portfolioreg.Canonical(vanished)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(vanished); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		name    string
+		args    []string
+		want    []string
+		count   int
+		applied bool
+	}{
+		{"dry run", []string{"--prune", "--json"}, []string{vanishedCanon}, 1, false},
+		{"apply", []string{"--prune", "--apply", "--json"}, []string{vanishedCanon}, 1, true},
+		{"apply with nothing left", []string{"--prune", "--apply", "--json"}, []string{}, 0, true},
+	} {
+		out := captureStdout(t, func() { cmdProjects(tc.args) })
+		var got struct {
+			Pruned  *[]string `json:"pruned"`
+			Count   int       `json:"count"`
+			Applied bool      `json:"applied"`
+		}
+		if err := json.Unmarshal([]byte(out), &got); err != nil {
+			t.Fatalf("%s: output %q: %v", tc.name, out, err)
+		}
+		if got.Pruned == nil {
+			t.Fatalf("%s: pruned is null or missing in %s; want an array", tc.name, out)
+		}
+		if !slices.Equal(*got.Pruned, tc.want) || got.Count != tc.count || got.Applied != tc.applied {
+			t.Errorf("%s: pruned=%v count=%d applied=%v; want %v, %d, %v",
+				tc.name, *got.Pruned, got.Count, got.Applied, tc.want, tc.count, tc.applied)
+		}
+	}
+}
+
+// TestProjectsApplyRequiresPrune: --apply on its own would fall through to the
+// listing and ignore the flag, which reads like a sweep that ran.
+func TestProjectsApplyRequiresPrune(t *testing.T) {
+	t.Setenv(portfolioreg.DBPathEnv, filepath.Join(t.TempDir(), "missing.db"))
+	stdout, stderr, code := runCLI(t, "projects", "--apply")
+	if code != 1 || !strings.Contains(stderr, "--apply requires --prune") || stdout != "" {
+		t.Fatalf("projects --apply: exit %d, stdout %q, stderr %q; want exit 1 and the usage error", code, stdout, stderr)
+	}
+}
+
+// TestProjectsPruneApplyRefusedOnPostgres: the postgres registry is shared by
+// every host and its rows carry no host identity, so a prune from one host
+// could remove another host's rows. The child gets no dsn and an empty HOME and
+// cwd, so even a missing refusal could not reach a database.
+func TestProjectsPruneApplyRefusedOnPostgres(t *testing.T) {
+	home := t.TempDir()
+	stdout, stderr, code := runCLIWith(t, home,
+		[]string{"HOME=" + home, "LEANKG_PROJECT=", "LEANKG_DB_ENGINE=postgres", "LEANKG_PG_URL="},
+		"projects", "--prune", "--apply")
+	if code != 1 || !strings.Contains(stderr, "no host identity") || !strings.Contains(stderr, "dry run") {
+		t.Fatalf("projects --prune --apply on postgres: exit %d, stdout %q, stderr %q; want exit 1 and the refusal", code, stdout, stderr)
+	}
+}
+
+// TestProjectsUnreachablePostgresIsAnError: a postgres registry that cannot be
+// reached is a fault, not "no registry". The dry run reads nothing and changes
+// nothing, so a clean exit would tell the operator a lie. The dsn is a closed
+// localhost port: the child gets connection refused and no database is touched.
+// Only the child's env carries the postgres engine; the test process stays sqlite.
+func TestProjectsUnreachablePostgresIsAnError(t *testing.T) {
+	home := t.TempDir()
+	env := []string{
+		"HOME=" + home, "LEANKG_PROJECT=", "LEANKG_DB_ENGINE=postgres",
+		"LEANKG_PG_URL=postgres://leankg@127.0.0.1:1/none?sslmode=disable",
+	}
+	stdout, stderr, code := runCLIWith(t, home, env, "projects", "--prune")
+	if code != 1 || strings.Contains(stdout, "nothing to prune") || !strings.Contains(stderr, "connection refused") {
+		t.Errorf("projects --prune: exit %d, stdout %q, stderr %q; want exit 1 and the connection error", code, stdout, stderr)
+	}
+	stdout, stderr, code = runCLIWith(t, home, env, "projects")
+	if code != 1 || strings.Contains(stdout, "no projects registered") || !strings.Contains(stderr, "connection refused") {
+		t.Errorf("projects: exit %d, stdout %q, stderr %q; want exit 1 and the connection error", code, stdout, stderr)
+	}
+}

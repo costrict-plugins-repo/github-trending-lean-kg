@@ -1,0 +1,1315 @@
+package embed
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"unicode/utf8"
+
+	"github.com/FreePeak/LeanKG/internal/store"
+)
+
+// --- fixtures ---------------------------------------------------------------
+
+func testStore(t *testing.T) *store.Store {
+	t.Helper()
+	st, err := store.Open(filepath.Join(t.TempDir(), ".leankg", "leankg.db"), store.RW)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { st.Close() })
+	if err := st.Migrate(); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	return st
+}
+
+func el(qn, content string) store.Element {
+	return store.Element{
+		QualifiedName: qn,
+		ElementType:   "function",
+		Name:          qn,
+		FilePath:      "src/f.go",
+		LineStart:     1,
+		LineEnd:       2,
+		Language:      "go",
+		Content:       content,
+	}
+}
+
+func seed(t *testing.T, st *store.Store, els ...store.Element) {
+	t.Helper()
+	if err := st.UpsertElements(els); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+}
+
+func mustRun(t *testing.T, st *store.Store, p Provider, mode string) Report {
+	t.Helper()
+	rep, err := Run(context.Background(), st, p, mode)
+	if err != nil {
+		t.Fatalf("Run(%s): %v", mode, err)
+	}
+	return rep
+}
+
+func vectorCount(t *testing.T, st *store.Store, modelID string) int {
+	t.Helper()
+	n, err := st.VectorCount(modelID)
+	if err != nil {
+		t.Fatalf("VectorCount: %v", err)
+	}
+	return n
+}
+
+func stampRows(t *testing.T, st *store.Store) int {
+	t.Helper()
+	db, err := sql.Open("sqlite", "file:"+st.Path()+"?_pragma=query_only(ON)")
+	if err != nil {
+		t.Fatalf("sidecar open: %v", err)
+	}
+	defer db.Close()
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM emb_stamp`).Scan(&n); err != nil {
+		t.Fatalf("count stamps: %v", err)
+	}
+	return n
+}
+
+// overrideProvider delegates to an inner provider but renames identity fields,
+// to simulate a provider whose stamp drifted (same model id, new revision).
+type overrideProvider struct {
+	inner             Provider
+	modelID, revision string
+	dims              int
+	provider          string // transport label override; "" keeps inner's
+}
+
+func (o overrideProvider) ModelID() string  { return o.modelID }
+func (o overrideProvider) Revision() string { return o.revision }
+func (o overrideProvider) Dimensions() int  { return o.dims }
+func (o overrideProvider) Distance() string { return o.inner.Distance() }
+func (o overrideProvider) Provider() string {
+	if o.provider != "" {
+		return o.provider
+	}
+	return o.inner.Provider()
+}
+func (o overrideProvider) Embed(ctx context.Context, kind TextKind, texts []string) ([][]float32, error) {
+	return o.inner.Embed(ctx, kind, texts)
+}
+
+// wrongDimsProvider returns wrong-dimension vectors for its first N calls,
+// then delegates. Exercises batch validation without failing the provider.
+type wrongDimsProvider struct {
+	inner            Provider
+	calls, failFirst int
+}
+
+func (w *wrongDimsProvider) ModelID() string  { return w.inner.ModelID() }
+func (w *wrongDimsProvider) Revision() string { return w.inner.Revision() }
+func (w *wrongDimsProvider) Dimensions() int  { return w.inner.Dimensions() }
+func (w *wrongDimsProvider) Distance() string { return w.inner.Distance() }
+func (w *wrongDimsProvider) Provider() string { return w.inner.Provider() }
+
+func (w *wrongDimsProvider) Embed(ctx context.Context, kind TextKind, texts []string) ([][]float32, error) {
+	w.calls++
+	if w.calls <= w.failFirst {
+		out := make([][]float32, len(texts))
+		for i := range out {
+			out[i] = make([]float32, w.inner.Dimensions()+1)
+		}
+		return out, nil
+	}
+	return w.inner.Embed(ctx, kind, texts)
+}
+
+// errProvider always fails its Embed call: transport-level provider failure.
+type errProvider struct{ inner Provider }
+
+func (e errProvider) ModelID() string  { return e.inner.ModelID() }
+func (e errProvider) Revision() string { return e.inner.Revision() }
+func (e errProvider) Dimensions() int  { return e.inner.Dimensions() }
+func (e errProvider) Distance() string { return e.inner.Distance() }
+func (e errProvider) Provider() string { return e.inner.Provider() }
+
+func (e errProvider) Embed(context.Context, TextKind, []string) ([][]float32, error) {
+	return nil, errors.New("provider down")
+}
+
+// --- Run --------------------------------------------------------------------
+
+func TestRunFullThenIncrementalSkipsUnchanged(t *testing.T) {
+	st := testStore(t)
+	seed(t, st, el("a::f1", "func f1() {}"), el("a::f2", "func f2() {}"), el("a::f3", "func f3() {}"))
+	p := Deterministic(8)
+
+	rep := mustRun(t, st, p, "full")
+	if rep.Embedded != 3 || rep.Dirty != 3 || rep.Skipped != 0 {
+		t.Fatalf("full run: got %+v, want Dirty=3 Embedded=3 Skipped=0", rep)
+	}
+	if rep.Coverage != 1 {
+		t.Fatalf("full run coverage: got %v, want 1", rep.Coverage)
+	}
+	if vectorCount(t, st, p.ModelID()) != 3 {
+		t.Fatalf("full run: want 3 vectors")
+	}
+
+	rep = mustRun(t, st, p, "incremental")
+	if rep.Dirty != 0 || rep.Embedded != 0 || rep.Skipped != 3 {
+		t.Fatalf("incremental run: got %+v, want Dirty=0 Embedded=0 Skipped=3", rep)
+	}
+
+	// Change one element's content: exactly that element re-embeds.
+	seed(t, st, el("a::f2", "func f2(x int) {}"))
+	rep = mustRun(t, st, p, "incremental")
+	if rep.Dirty != 1 || rep.Embedded != 1 || rep.Skipped != 2 {
+		t.Fatalf("incremental after edit: got %+v, want Dirty=1 Embedded=1 Skipped=2", rep)
+	}
+	if vectorCount(t, st, p.ModelID()) != 3 {
+		t.Fatalf("after edit: want still 3 vectors")
+	}
+}
+
+// TestIncrementalBacklogMatchesRunDirty: the hook gate counts what an incremental
+// run would embed. Elements with no stored state count, and the count equals the
+// run's Dirty before the run, after it, and after an edit.
+func TestIncrementalBacklogMatchesRunDirty(t *testing.T) {
+	st := testStore(t)
+	seed(t, st, el("a::f1", "func f1() {}"), el("a::f2", "func f2() {}"), el("a::f3", "func f3() {}"))
+	p := Deterministic(8)
+	assertBacklog := func(want int) {
+		t.Helper()
+		got, err := IncrementalBacklog(st, p)
+		if err != nil {
+			t.Fatalf("IncrementalBacklog: %v", err)
+		}
+		if got != want {
+			t.Fatalf("IncrementalBacklog = %d, want %d", got, want)
+		}
+	}
+
+	assertBacklog(3)
+	if rep := mustRun(t, st, p, "incremental"); rep.Dirty != 3 {
+		t.Fatalf("first incremental run: Dirty = %d, want 3", rep.Dirty)
+	}
+	assertBacklog(0)
+
+	seed(t, st, el("a::f2", "func f2(x int) {}"))
+	assertBacklog(1)
+	if rep := mustRun(t, st, p, "incremental"); rep.Dirty != 1 {
+		t.Fatalf("incremental after edit: Dirty = %d, want 1", rep.Dirty)
+	}
+}
+
+func TestRunStampMismatchClearsAndRebuilds(t *testing.T) {
+	st := testStore(t)
+	seed(t, st, el("a::f1", "func f1() {}"), el("a::f2", "func f2() {}"))
+	p1 := Deterministic(8)
+	mustRun(t, st, p1, "full")
+
+	// Same model id, drifted revision: a full run must clear + rebuild.
+	p2 := overrideProvider{inner: Deterministic(8), modelID: p1.ModelID(), revision: "test:deterministic-v2", dims: 8}
+	rep := mustRun(t, st, p2, "full")
+	if rep.Embedded != 2 {
+		t.Fatalf("rebuild: got %+v, want Embedded=2", rep)
+	}
+	cur, err := st.Stamp(p1.ModelID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cur == nil || cur.Revision != "test:deterministic-v2" {
+		t.Fatalf("stamp after rebuild: got %+v, want revision test:deterministic-v2", cur)
+	}
+	if n := stampRows(t, st); n != 1 {
+		t.Fatalf("want exactly 1 stamp row, got %d", n)
+	}
+	if vectorCount(t, st, p1.ModelID()) != 2 {
+		t.Fatalf("want 2 vectors after rebuild (no mixed/stale rows)")
+	}
+
+	// Incremental against the rebuilt collection finds nothing dirty.
+	rep = mustRun(t, st, p2, "incremental")
+	if rep.Embedded != 0 || rep.Skipped != 2 {
+		t.Fatalf("incremental after rebuild: got %+v, want Embedded=0 Skipped=2", rep)
+	}
+}
+
+func TestRunValidationFailureCountedNotFatal(t *testing.T) {
+	st := testStore(t)
+	seed(t, st, el("a::f1", "func f1() {}"), el("a::f2", "func f2() {}"), el("a::f3", "func f3() {}"))
+	p := &wrongDimsProvider{inner: Deterministic(8), failFirst: 1}
+
+	rep, err := Run(context.Background(), st, p, "full")
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if rep.Failed != 3 || rep.Embedded != 0 {
+		t.Fatalf("got %+v, want Failed=3 Embedded=0", rep)
+	}
+	if rep.Coverage != 0 {
+		t.Fatalf("coverage: got %v, want 0", rep.Coverage)
+	}
+	run, err := st.LastEmbedRun(p.ModelID())
+	if err != nil || run == nil {
+		t.Fatalf("LastEmbedRun: %v %v", run, err)
+	}
+	if run.Status != "partial" {
+		t.Fatalf("run status: got %q, want partial", run.Status)
+	}
+
+	// Retry succeeds and converges.
+	rep = mustRun(t, st, p, "full")
+	if rep.Embedded != 3 || rep.Failed != 0 {
+		t.Fatalf("retry: got %+v, want Embedded=3 Failed=0", rep)
+	}
+}
+
+func TestRunProviderErrorSurfaces(t *testing.T) {
+	st := testStore(t)
+	seed(t, st, el("a::f1", "func f1() {}"))
+	p := errProvider{inner: Deterministic(8)}
+
+	_, err := Run(context.Background(), st, p, "full")
+	if err == nil || !strings.Contains(err.Error(), "provider down") {
+		t.Fatalf("Run error: got %v, want provider failure surfaced", err)
+	}
+	run, _ := st.LastEmbedRun(p.ModelID())
+	if run == nil || run.Status != "failed" {
+		t.Fatalf("run status: got %+v, want failed", run)
+	}
+}
+
+func TestRunEmptyStoreOK(t *testing.T) {
+	st := testStore(t)
+	p := Deterministic(8)
+	for _, mode := range []string{"full", "incremental"} {
+		rep := mustRun(t, st, p, mode)
+		if rep.Dirty != 0 || rep.Embedded != 0 || rep.Coverage != 1 {
+			t.Fatalf("%s on empty store: got %+v", mode, rep)
+		}
+	}
+	if vectorCount(t, st, p.ModelID()) != 0 {
+		t.Fatal("empty store produced vectors")
+	}
+}
+
+func TestRunTruncationCounted(t *testing.T) {
+	st := testStore(t)
+	seed(t, st, el("a::big", strings.Repeat("x", 8001)))
+	p := Deterministic(8)
+
+	rep := mustRun(t, st, p, "full")
+	if rep.Truncations != 1 || rep.Embedded != 1 {
+		t.Fatalf("got %+v, want Truncations=1 Embedded=1", rep)
+	}
+}
+
+// recordProvider delegates to an inner provider, overrides the Provider()
+// family label (to exercise family-specific text budgets), and records every
+// text it was asked to embed.
+type recordProvider struct {
+	inner    Provider
+	provider string
+	texts    []string
+}
+
+func (r *recordProvider) ModelID() string  { return r.inner.ModelID() }
+func (r *recordProvider) Revision() string { return r.inner.Revision() }
+func (r *recordProvider) Dimensions() int  { return r.inner.Dimensions() }
+func (r *recordProvider) Distance() string { return r.inner.Distance() }
+func (r *recordProvider) Provider() string { return r.provider }
+
+func (r *recordProvider) Embed(ctx context.Context, kind TextKind, texts []string) ([][]float32, error) {
+	if kind == Document { // query-kind calls are the calibration probes
+		r.texts = append(r.texts, texts...)
+	}
+	return r.inner.Embed(ctx, kind, texts)
+}
+
+// The local sidecar family (llama.cpp serving BERT-size GGUF embedders) has a
+// 512-token model context and answers HTTP 500 for anything longer — unlike
+// the ONNX-era pipeline, which truncated. Found dogfooding `leankg-embed run`
+// on this repository: one 845-token element aborted the whole run.
+func TestRunLocalProviderTextBudget(t *testing.T) {
+	// local: a 4000-rune element is 512-token-safe-truncated and counted. No
+	// sidecar answers /props here, so the operator pin is the cap.
+	t.Setenv("LEANKG_EMBED_TEXT_CAP", fmt.Sprint(maxLocalTextChars))
+	st := testStore(t)
+	seed(t, st, el("a::big", strings.Repeat("x", 4000)))
+	p := &recordProvider{inner: Deterministic(8), provider: "local"}
+	rep := mustRun(t, st, p, "full")
+	if rep.Truncations != 1 {
+		t.Fatalf("local run: Truncations=%d, want 1 (%+v)", rep.Truncations, rep)
+	}
+	if len(p.texts) != 1 || utf8.RuneCountInString(p.texts[0]) > maxLocalTextChars {
+		got := -1
+		if len(p.texts) == 1 {
+			got = utf8.RuneCountInString(p.texts[0])
+		}
+		t.Fatalf("local run: sent %d text(s), rune len %d, want exactly 1 <= %d",
+			len(p.texts), got, maxLocalTextChars)
+	}
+
+	st2 := testStore(t)
+	seed(t, st2, el("a::big", strings.Repeat("x", 4000)))
+	p2 := &recordProvider{inner: Deterministic(8), provider: "openai"}
+	rep2 := mustRun(t, st2, p2, "full")
+	// The document is the header line plus the full content (RS-11).
+	if rep2.Truncations != 0 || len(p2.texts) != 1 || !strings.HasSuffix(p2.texts[0], "\n"+strings.Repeat("x", 4000)) {
+		t.Fatalf("openai run: got truncations=%d, %d texts, want 0 and the full 4000-rune content",
+			rep2.Truncations, len(p2.texts))
+	}
+}
+
+// longTextProvider fails any call containing a text over maxRunes, mimicking
+// a llama.cpp sidecar answering HTTP 500 for input beyond the model context.
+type longTextProvider struct {
+	inner    Provider
+	maxRunes int
+}
+
+func (l *longTextProvider) ModelID() string  { return l.inner.ModelID() }
+func (l *longTextProvider) Revision() string { return l.inner.Revision() }
+func (l *longTextProvider) Dimensions() int  { return l.inner.Dimensions() }
+func (l *longTextProvider) Distance() string { return l.inner.Distance() }
+func (l *longTextProvider) Provider() string { return l.inner.Provider() }
+
+func (l *longTextProvider) Embed(ctx context.Context, kind TextKind, texts []string) ([][]float32, error) {
+	for _, s := range texts {
+		if utf8.RuneCountInString(s) > l.maxRunes {
+			return nil, fmt.Errorf("input (%d runes) is too large to process", utf8.RuneCountInString(s))
+		}
+	}
+	return l.inner.Embed(ctx, kind, texts)
+}
+
+// A poison element the provider rejects must cost exactly itself: counted in
+// Failed, left dirty, and NOT abort the run — its healthy sibling in the same
+// file still gets vectors. Found dogfooding `leankg-embed` on this repo, where
+// one over-context element killed the whole pass.
+func TestRunPoisonItemDoesNotAbortRun(t *testing.T) {
+	st := testStore(t)
+	seed(t, st,
+		el("a::f1", "func f1() {}"),
+		el("a::poison", strings.Repeat("y", 1500)))
+	p := &longTextProvider{inner: Deterministic(8), maxRunes: 100}
+
+	rep, err := Run(context.Background(), st, p, "full")
+	if err != nil {
+		t.Fatalf("Run: %v — a rejected item must not abort the run", err)
+	}
+	if rep.Embedded != 1 || rep.Failed != 1 {
+		t.Fatalf("got %+v, want Embedded=1 Failed=1", rep)
+	}
+	if vectorCount(t, st, p.ModelID()) != 1 {
+		t.Fatal("healthy sibling lost its vector")
+	}
+	run, _ := st.LastEmbedRun(p.ModelID())
+	if run == nil || run.Status != "partial" {
+		t.Fatalf("run status: got %+v, want partial", run)
+	}
+}
+
+// Ceiling demonstration: when EVERY item fails (a dead provider — errProvider
+// fails any call at any length), the run still aborts loudly with the
+// provider's own error and records the run failed.
+func TestRunAllFailedProviderAbortsLoudly(t *testing.T) {
+	st := testStore(t)
+	seed(t, st, el("a::f1", "func f1() {}"))
+	p := errProvider{inner: Deterministic(8)}
+
+	_, err := Run(context.Background(), st, p, "full")
+	if err == nil || !strings.Contains(err.Error(), "provider down") || !strings.Contains(err.Error(), "all 1 item(s) failed") {
+		t.Fatalf("Run error: got %v, want loud all-failed abort naming the provider error", err)
+	}
+	run, _ := st.LastEmbedRun(p.ModelID())
+	if run == nil || run.Status != "failed" {
+		t.Fatalf("run status: got %+v, want failed", run)
+	}
+}
+
+// The character budget is a heuristic — dense content (Godot/TypeScript
+// measured 523 tokens in 1000 runes) can exceed the model context even at
+// the cap. The run must SHRINK and retry (counting truncations) instead of
+// failing every item and misclassifying the run as provider-down.
+// (Found on the first portfolio child: games/the-survival, 14/14 items over
+// context at the 1000-rune cap.)
+func TestRunShrinksDenseItemsBelowModelContext(t *testing.T) {
+	st := testStore(t)
+	seed(t, st,
+		el("a::ok", "func f() {}"),
+		el("a::dense", strings.Repeat("x", 4000)))
+	p := &longTextProvider{inner: Deterministic(8), maxRunes: 2000}
+
+	rep, err := Run(context.Background(), st, p, "full")
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if rep.Failed != 0 || rep.Embedded != 2 {
+		t.Fatalf("got %+v, want both items embedded via shrink (Failed=0 Embedded=2)", rep)
+	}
+	if rep.Truncations == 0 {
+		t.Fatal("dense shrink not counted in Truncations")
+	}
+}
+
+func TestRunUnknownModeRejected(t *testing.T) {
+	st := testStore(t)
+	if _, err := Run(context.Background(), st, Deterministic(8), "everything"); err == nil {
+		t.Fatal("want error for unknown mode")
+	}
+}
+
+// --- Deterministic provider ---------------------------------------------------
+
+func TestDeterministicProviderIdentity(t *testing.T) {
+	p := Deterministic(384)
+	if p.ModelID() != "deterministic-384" || p.Revision() != "test:deterministic-v1" ||
+		p.Dimensions() != 384 || p.Distance() != "cosine" || p.Provider() != "deterministic" {
+		t.Fatalf("unexpected identity: %s %s %d %s %s",
+			p.ModelID(), p.Revision(), p.Dimensions(), p.Distance(), p.Provider())
+	}
+	vecs, err := p.Embed(context.Background(), Document, []string{"hello", "hello"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range vecs[0] {
+		if vecs[0][i] != vecs[1][i] {
+			t.Fatal("same text must embed identically")
+		}
+	}
+	var norm float64
+	for _, x := range vecs[0] {
+		norm += float64(x) * float64(x)
+	}
+	if norm < 0.999 || norm > 1.001 {
+		t.Fatalf("vector not unit length: %v", norm)
+	}
+}
+
+// --- OpenAICompatible (httptest only — no live network) -----------------------
+
+func openAIResponse(t *testing.T, body embeddingsRequest, dims int) []byte {
+	t.Helper()
+	data := make([]map[string]any, len(body.Input))
+	for i := range data {
+		vec := make([]float32, dims)
+		for j := range vec {
+			vec[j] = 0.1
+		}
+		data[i] = map[string]any{"embedding": vec}
+	}
+	out, err := json.Marshal(map[string]any{"data": data})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+func newOpenAITestServer(t *testing.T, wantAuth string, dims int, check func(body embeddingsRequest)) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != wantAuth {
+			t.Errorf("Authorization header: got %q, want %q", got, wantAuth)
+		}
+		if r.Method != http.MethodPost || r.URL.Path != "/embeddings" {
+			t.Errorf("request: got %s %s, want POST /embeddings", r.Method, r.URL.Path)
+		}
+		var body embeddingsRequest
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode request body: %v", err)
+			http.Error(w, "bad json", http.StatusBadRequest)
+			return
+		}
+		check(body)
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(openAIResponse(t, body, dims))
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func TestOpenAICompatibleSendsAuthAndShape(t *testing.T) {
+	srv := newOpenAITestServer(t, "Bearer sk-test", 4, func(body embeddingsRequest) {
+		if body.Model != "m-1" {
+			t.Errorf("model: got %q, want m-1", body.Model)
+		}
+		if len(body.Input) != 2 || body.Input[0] != "alpha" || body.Input[1] != "beta" {
+			t.Errorf("input: got %v", body.Input)
+		}
+	})
+
+	p := OpenAICompatible(srv.URL, "sk-test", "m-1", 4, "rev-1")
+	vecs, err := p.Embed(context.Background(), Document, []string{"alpha", "beta"})
+	if err != nil {
+		t.Fatalf("Embed: %v", err)
+	}
+	if len(vecs) != 2 || len(vecs[0]) != 4 {
+		t.Fatalf("shape: %d x %d", len(vecs), len(vecs[0]))
+	}
+}
+
+func TestOpenAICompatibleNoAuthHeaderWhenKeyEmpty(t *testing.T) {
+	srv := newOpenAITestServer(t, "", 4, func(embeddingsRequest) {})
+	p := OpenAICompatible(srv.URL, "", "m-1", 4, "rev-1")
+	if _, err := p.Embed(context.Background(), Document, []string{"alpha"}); err != nil {
+		t.Fatalf("Embed: %v", err)
+	}
+}
+
+func TestOpenAICompatibleErrorIncludesBodySnippet(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "model overloaded", http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	p := OpenAICompatible(srv.URL, "", "m-1", 4, "rev-1")
+	_, err := p.Embed(context.Background(), Document, []string{"alpha"})
+	if err == nil || !strings.Contains(err.Error(), "model overloaded") || !strings.Contains(err.Error(), "500") {
+		t.Fatalf("Embed error: got %v, want status 500 + body snippet", err)
+	}
+}
+
+// --- FromEnv -------------------------------------------------------------------
+
+func TestFromEnv(t *testing.T) {
+	t.Run("deterministic", func(t *testing.T) {
+		t.Setenv("LEANKG_EMBED_PROVIDER", "deterministic")
+		t.Setenv("LEANKG_EMBED_MODEL", "")
+		t.Setenv("LEANKG_EMBED_BASE_URL", "")
+		t.Setenv("LEANKG_EMBED_DIMS", "16")
+		t.Setenv("LEANKG_EMBED_REVISION", "")
+		t.Setenv("LEANKG_EMBED_API_KEY", "")
+		p, err := FromEnv()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if p.ModelID() != "deterministic-16" || p.Dimensions() != 16 {
+			t.Fatalf("got %s/%d", p.ModelID(), p.Dimensions())
+		}
+	})
+
+	t.Run("openai requires model", func(t *testing.T) {
+		t.Setenv("LEANKG_EMBED_PROVIDER", "openai")
+		// The absent case is the point of this case, so it is stated, not
+		// inherited: an operator's exported LEANKG_EMBED_MODEL must not make
+		// the openai provider look configured.
+		t.Setenv("LEANKG_EMBED_MODEL", "")
+		t.Setenv("LEANKG_EMBED_BASE_URL", "")
+		t.Setenv("LEANKG_EMBED_DIMS", "")
+		t.Setenv("LEANKG_EMBED_REVISION", "")
+		t.Setenv("LEANKG_EMBED_API_KEY", "")
+		if _, err := FromEnv(); err == nil {
+			t.Fatal("want error when LEANKG_EMBED_MODEL unset for openai")
+		}
+		t.Setenv("LEANKG_EMBED_MODEL", "text-embedding-3-small")
+		t.Setenv("LEANKG_EMBED_BASE_URL", "https://api.example.com/v1")
+		t.Setenv("LEANKG_EMBED_API_KEY", "sk-x")
+		t.Setenv("LEANKG_EMBED_DIMS", "1536")
+		p, err := FromEnv()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if p.ModelID() != "text-embedding-3-small" || p.Dimensions() != 1536 || p.Provider() != "openai" {
+			t.Fatalf("got %s/%d/%s", p.ModelID(), p.Dimensions(), p.Provider())
+		}
+	})
+
+	t.Run("local attaches to an explicit base URL", func(t *testing.T) {
+		t.Setenv("LEANKG_EMBED_PROVIDER", "local")
+		// Both halves of this case are stated: no endpoint to attach to (the
+		// absent case), and the explicit one (the present case). The model
+		// stays unset so the local identity is the legacy "local"/"local:local".
+		t.Setenv("LEANKG_EMBED_MODEL", "")
+		t.Setenv("LEANKG_EMBED_DIMS", "")
+		t.Setenv("LEANKG_EMBED_REVISION", "")
+		t.Setenv("LEANKG_EMBED_API_KEY", "")
+		t.Setenv("LEANKG_EMBED_BASE_URL", "")
+		// Attach constructor: without a base URL there is nothing to attach
+		// to and it must fail with an actionable error, never silently
+		// produce vectors.
+		if _, err := FromEnv(); err == nil || !strings.Contains(err.Error(), "sidecar") {
+			t.Fatalf("want actionable sidecar error, got %v", err)
+		}
+		// Hermetic: a sidecar with no /props (another OpenAI-compatible
+		// server) keeps the legacy identity. Never a fixed port — a real
+		// sidecar on this host would answer and fingerprint the test.
+		bare := httptest.NewServer(http.NotFoundHandler())
+		defer bare.Close()
+		t.Setenv("LEANKG_EMBED_BASE_URL", bare.URL+"/v1")
+		p, err := FromEnv()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if p.Provider() != "local" {
+			t.Fatalf("Provider: got %q, want local", p.Provider())
+		}
+		o, ok := p.(*localProvider)
+		if !ok {
+			t.Fatalf("want *localProvider, got %T", p)
+		}
+		if o.baseURL != bare.URL+"/v1" {
+			t.Fatalf("base URL: got %q", o.baseURL)
+		}
+		if o.ModelID() != "local" || o.Revision() != "local:local" {
+			t.Fatalf("stamp defaults: got %s/%s", o.ModelID(), o.Revision())
+		}
+	})
+
+	t.Run("local fingerprints the served model (RS-14)", func(t *testing.T) {
+		t.Setenv("LEANKG_EMBED_PROVIDER", "local")
+		t.Setenv("LEANKG_EMBED_REVISION", "")
+		t.Setenv("LEANKG_EMBED_MODEL", "")
+		model := "/cache/hub/models--x--bge-gguf/snapshots/d32f8c040ea3b516330eeb75b72bcc2d3a780ab7/bge-small-en-v1.5-f16.gguf"
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/props" {
+				http.NotFound(w, r)
+				return
+			}
+			_, _ = w.Write([]byte(`{"model_path":"` + model + `","default_generation_settings":{"n_ctx":512}}`))
+		}))
+		defer srv.Close()
+		t.Setenv("LEANKG_EMBED_BASE_URL", srv.URL+"/v1")
+		p, err := FromEnv()
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := "local:bge-small-en-v1.5-f16.gguf@d32f8c040ea3b516330eeb75b72bcc2d3a780ab7"
+		if got := p.Revision(); got != want {
+			t.Fatalf("revision = %q, want %q", got, want)
+		}
+		if tb := p.(*localProvider).TextBudget(); tb != 960 {
+			t.Fatalf("text budget from n_ctx 512 = %d, want 960", tb)
+		}
+		// An explicit operator pin still wins.
+		t.Setenv("LEANKG_EMBED_REVISION", "my-pin")
+		p2, _ := FromEnv()
+		if p2.Revision() != "my-pin" {
+			t.Fatalf("explicit pin overridden: %q", p2.Revision())
+		}
+	})
+
+	t.Run("unknown provider", func(t *testing.T) {
+		t.Setenv("LEANKG_EMBED_PROVIDER", "quantum")
+		if _, err := FromEnv(); err == nil {
+			t.Fatal("want error for unknown provider")
+		}
+	})
+}
+
+// --- NDJSON export/import ------------------------------------------------------
+
+func TestNDJSONRoundTrip(t *testing.T) {
+	// The export resolves its provider from the environment, as the import does:
+	// the deterministic provider at width 8 is the identity both sides share.
+	t.Setenv("LEANKG_EMBED_PROVIDER", "deterministic")
+	t.Setenv("LEANKG_EMBED_DIMS", "8")
+	st1 := testStore(t)
+	els := []store.Element{el("a::f1", "func f1() {}"), el("a::f2", "func f2() {}"), el("b::g", "def g(): pass")}
+	seed(t, st1, els...)
+
+	var buf bytes.Buffer
+	if err := ExportNDJSON(context.Background(), st1, "deterministic-8", &buf); err != nil {
+		t.Fatalf("ExportNDJSON: %v", err)
+	}
+
+	// Export shape: one JSON line per element with content_hash = sha256(content).
+	lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("export: got %d lines, want 3", len(lines))
+	}
+	var line exportLine
+	if err := json.Unmarshal([]byte(lines[0]), &line); err != nil {
+		t.Fatalf("decode export line: %v", err)
+	}
+	// readElements orders by qualified_name: a::f1 < a::f2 < b::g.
+	sum := sha256.Sum256([]byte("func f1() {}"))
+	if line.Text != "function a::f1 — src/f.go\nfunc f1() {}" || line.ContentHash != hex.EncodeToString(sum[:]) || line.QualifiedName != "a::f1" {
+		t.Fatalf("export line: got %+v", line)
+	}
+	// Simulate the offsite workflow: export → embed elsewhere → import.
+	simulateOffsite := func(export *bytes.Buffer) *bytes.Buffer {
+		var out bytes.Buffer
+		sc := bufio.NewScanner(export)
+		for sc.Scan() {
+			var e exportLine
+			if err := json.Unmarshal(sc.Bytes(), &e); err != nil {
+				t.Fatal(err)
+			}
+			vecs, err := Deterministic(8).Embed(context.Background(), Document, []string{e.Text})
+			if err != nil {
+				t.Fatal(err)
+			}
+			b, err := json.Marshal(importLine{QualifiedName: e.QualifiedName, Vec: vecs[0]})
+			if err != nil {
+				t.Fatal(err)
+			}
+			out.Write(b)
+			out.WriteByte('\n')
+		}
+		return &out
+	}
+
+	// Import into a fresh store: writes vectors + stamp; second import resumes.
+	st2 := testStore(t)
+	seed(t, st2, els...)
+	import1 := simulateOffsite(&buf)
+	rep, err := ImportNDJSON(context.Background(), st2, "deterministic-8", "test:deterministic-v1", "cosine", 8, import1)
+	if err != nil {
+		t.Fatalf("ImportNDJSON: %v", err)
+	}
+	if rep.Embedded != 3 || rep.Skipped != 0 {
+		t.Fatalf("import: got %+v, want Embedded=3 Skipped=0", rep)
+	}
+	if vectorCount(t, st2, "deterministic-8") != 3 {
+		t.Fatal("import: want 3 vectors")
+	}
+	cur, _ := st2.Stamp("deterministic-8")
+	if cur == nil || cur.Revision != "test:deterministic-v1" || cur.Dimensions != 8 || cur.Distance != "cosine" || cur.Provider != "deterministic" {
+		t.Fatalf("import stamp: got %+v", cur)
+	}
+
+	buf2 := bytes.Buffer{}
+	if err := ExportNDJSON(context.Background(), st2, "deterministic-8", &buf2); err != nil {
+		t.Fatal(err)
+	}
+	rep, err = ImportNDJSON(context.Background(), st2, "deterministic-8", "test:deterministic-v1", "cosine", 8, simulateOffsite(&buf2))
+	if err != nil {
+		t.Fatalf("re-import: %v", err)
+	}
+	if rep.Embedded != 0 || rep.Skipped != 3 {
+		t.Fatalf("re-import: got %+v, want Embedded=0 Skipped=3 (resume)", rep)
+	}
+}
+
+func TestImportNDJSONDimGuardAndOrphans(t *testing.T) {
+	t.Setenv("LEANKG_EMBED_PROVIDER", "openai")
+	t.Setenv("LEANKG_EMBED_MODEL", "m")
+	t.Setenv("LEANKG_EMBED_DIMS", "8")
+	t.Setenv("LEANKG_EMBED_REVISION", "rev")
+	st := testStore(t)
+	seed(t, st, el("a::f1", "func f1() {}"))
+
+	// One valid line (8 dims), one wrong-dim line: the import errors and
+	// writes nothing (crash-consistent).
+	r := strings.NewReader(`{"qualified_name":"a::f1","vec":[0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8]}` + "\n" +
+		`{"qualified_name":"a::f2","vec":[0.1,0.2,0.3,0.4,0.5,0.6,0.7]}` + "\n")
+	if _, err := ImportNDJSON(context.Background(), st, "m", "rev", "cosine", 8, r); err == nil {
+		t.Fatal("want error for wrong-dim import line")
+	}
+	if vectorCount(t, st, "m") != 0 {
+		t.Fatal("dim-guard: nothing must be written when a line fails")
+	}
+
+	// A line for a QN with no element counts as an orphan and is not written.
+	r = strings.NewReader(`{"qualified_name":"gone::x","vec":[0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8]}` + "\n" +
+		`{"qualified_name":"a::f1","vec":[0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8]}` + "\n")
+	rep, err := ImportNDJSON(context.Background(), st, "m", "rev", "cosine", 8, r)
+	if err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	if rep.Embedded != 1 || rep.Orphans != 1 {
+		t.Fatalf("import: got %+v, want Embedded=1 Orphans=1", rep)
+	}
+}
+
+// TestRunIncrementalOnFreshStampsCollection pins the FR-ZCP-11 first-build
+// rule for incremental runs: a fresh store gets the provider stamp written
+// on the FIRST run of any mode (without it, L3 stays dead — the live smoke
+// caught exactly this hole).
+func TestRunIncrementalOnFreshStampsCollection(t *testing.T) {
+	st := testStore(t)
+	seed(t, st, el("a::f1", "func f1() {}"), el("a::f2", "func f2() {}"))
+	p := Deterministic(8)
+
+	rep := mustRun(t, st, p, "incremental")
+	if rep.Embedded != 2 {
+		t.Fatalf("incremental fresh: got %+v, want Embedded=2", rep)
+	}
+	cur, err := st.Stamp(p.ModelID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cur == nil {
+		t.Fatal("incremental run on fresh store left NO stamp — L3 would be dead")
+	}
+	if cur.Revision != p.Revision() || cur.Provider != p.Provider() {
+		t.Fatalf("stamp: got %+v", cur)
+	}
+}
+
+// TestRunIncrementalMismatchHardFails pins the flag-slip safety: incremental
+// against a drifted stamp must HARD-FAIL with a rebuild directive and write
+// NOTHING — an accidental provider switch must not wipe the old collection.
+func TestRunIncrementalMismatchHardFails(t *testing.T) {
+	st := testStore(t)
+	seed(t, st, el("a::f1", "func f1() {}"), el("a::f2", "func f2() {}"))
+	p1 := Deterministic(8)
+	mustRun(t, st, p1, "full")
+	before := vectorCount(t, st, p1.ModelID())
+
+	p2 := overrideProvider{inner: Deterministic(8), modelID: p1.ModelID(), revision: "test:deterministic-v2", dims: 8}
+	if _, err := Run(context.Background(), st, p2, "incremental"); err == nil {
+		t.Fatal("incremental against drifted stamp must hard-fail")
+	} else if !strings.Contains(err.Error(), "leankg-embed full") {
+		t.Fatalf("error must carry the rebuild directive: %v", err)
+	}
+	if got := vectorCount(t, st, p1.ModelID()); got != before {
+		t.Fatalf("failed incremental run must not touch vectors: had %d, now %d", before, got)
+	}
+}
+
+// TestRunIncrementalIgnoresProviderLabel pins that a provider label which does
+// not change the text cap is not drift: a collection stamped "openai" (8000-rune
+// cap) is embedded incrementally under "openai-compatible" (same 8000-rune cap),
+// with no stamp mismatch, and the stored stamp row keeps the provider it was
+// written with. The label is "openai-compatible" rather than "local" because
+// "local" has a 1000-rune cap, and that case must refuse (see
+// TestRunIncrementalRefusesLabelThatChangesTextCap).
+func TestRunIncrementalIgnoresProviderLabel(t *testing.T) {
+	st := testStore(t)
+	seed(t, st, el("a::f1", "func f1() {}"), el("a::f2", "func f2() {}"))
+	stamped := overrideProvider{inner: Deterministic(8), modelID: "embeddinggemma-2", revision: "test:gemma-v1", dims: 8, provider: "openai"}
+	mustRun(t, st, stamped, "full")
+
+	local := stamped
+	local.provider = "openai-compatible"
+	seed(t, st, el("a::f3", "func f3() {}"))
+	rep, err := Run(context.Background(), st, local, "incremental")
+	if err != nil {
+		t.Fatalf("incremental with provider label local over openai stamp: %v", err)
+	}
+	if rep.Embedded != 1 || rep.Skipped != 2 {
+		t.Fatalf("incremental: got %+v, want Embedded=1 Skipped=2", rep)
+	}
+	cur, err := st.Stamp("embeddinggemma-2")
+	if err != nil || cur == nil || cur.Provider != "openai" {
+		t.Fatalf("stored stamp = %+v, %v; want the original provider openai kept", cur, err)
+	}
+	if n := vectorCount(t, st, "embeddinggemma-2"); n != 3 {
+		t.Fatalf("vectors: got %d, want 3", n)
+	}
+}
+
+// TestRunIncrementalRefusesLabelThatChangesTextCap pins that an incremental run
+// whose budget-derived cap is lower than the recorded cap is refused: an
+// openai-stamped collection (recorded 8000-rune cap) must not take a "local" run
+// whose sidecar budget is 960 runes, or the new element is cut differently from
+// its neighbours. The refusal names `leankg-embed full` and the n_ctx fix, and
+// writes nothing.
+func TestRunIncrementalRefusesLabelThatChangesTextCap(t *testing.T) {
+	st := testStore(t)
+	seed(t, st, el("a::f1", "func f1() {}"), el("a::f2", "func f2() {}"))
+	stamped := overrideProvider{inner: Deterministic(8), modelID: "embeddinggemma-2", revision: "test:gemma-v1", dims: 8, provider: "openai"}
+	mustRun(t, st, stamped, "full")
+	before := vectorCount(t, st, "embeddinggemma-2")
+
+	seed(t, st, el("a::big", strings.Repeat("x", 3000)))
+	local := &budgetSeq{inner: overrideProvider{inner: Deterministic(8), modelID: "embeddinggemma-2", revision: "test:gemma-v1", dims: 8, provider: "local"}, budgets: []int{960}}
+	_, err := Run(context.Background(), st, local, "incremental")
+	if err == nil {
+		t.Fatal("incremental with a 960-rune sidecar budget over an 8000-rune collection must refuse")
+	}
+	if !strings.Contains(err.Error(), "leankg-embed full") || !strings.Contains(err.Error(), "n_ctx") {
+		t.Fatalf("refusal must name leankg-embed full and the n_ctx fix: %v", err)
+	}
+	if got := vectorCount(t, st, "embeddinggemma-2"); got != before {
+		t.Fatalf("refused run must write no vectors: had %d, now %d", before, got)
+	}
+	if cur, err := st.Stamp("embeddinggemma-2"); err != nil || cur == nil || cur.Provider != "openai" {
+		t.Fatalf("stored stamp = %+v, %v; want the original provider openai kept", cur, err)
+	}
+}
+
+// TestRunIncrementalRefusesRealStampDrift pins that the writer guard still
+// protects real identity drift: an incremental run against a stored stamp that
+// differs in one identity field refuses, names that field in the directive, and
+// writes no vectors and no stamp. Model is not a row here: a different model id
+// is a different collection (its own stamp row), so it cannot mismatch.
+func TestRunIncrementalRefusesRealStampDrift(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		break_ func(*store.ModelStamp)
+		field  string
+	}{
+		{"revision", func(s *store.ModelStamp) { s.Revision += "-drift" }, "revision"},
+		{"dimensions", func(s *store.ModelStamp) { s.Dimensions++ }, "dimensions"},
+		{"distance", func(s *store.ModelStamp) { s.Distance = "dot" }, "distance"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := testStore(t)
+			seed(t, st, el("a::f1", "func f1() {}"), el("a::f2", "func f2() {}"))
+			p := Deterministic(8)
+			mustRun(t, st, p, "full")
+			stored, err := st.Stamp(p.ModelID())
+			if err != nil || stored == nil {
+				t.Fatalf("stamp after full: %v %v", stored, err)
+			}
+			drifted := *stored
+			tc.break_(&drifted)
+			if err := st.WriteStamp(drifted); err != nil {
+				t.Fatal(err)
+			}
+			seed(t, st, el("a::f3", "func f3() {}"))
+			before := vectorCount(t, st, p.ModelID())
+
+			_, err = Run(context.Background(), st, p, "incremental")
+			if err == nil || !strings.Contains(err.Error(), "stamp mismatch") {
+				t.Fatalf("incremental drift error = %v, want stamp mismatch", err)
+			}
+			if !strings.Contains(err.Error(), tc.field) {
+				t.Fatalf("drift error must name %q: %v", tc.field, err)
+			}
+			if got := vectorCount(t, st, p.ModelID()); got != before {
+				t.Fatalf("refused run must write no vectors: had %d, now %d", before, got)
+			}
+			if after, _ := st.Stamp(p.ModelID()); after == nil || *after != drifted {
+				t.Fatalf("refused run must leave the stored stamp: got %+v, want %+v", after, drifted)
+			}
+		})
+	}
+}
+
+// TestRunCalibratesNoiseFloor: every run that embeds records the collection's
+// noise floor for its exact identity; another identity reads nothing.
+func TestRunCalibratesNoiseFloor(t *testing.T) {
+	st := testStore(t)
+	seed(t, st, el("a::f1", "func f1() {}"), el("a::f2", "func f2() {}"))
+	p := Deterministic(8)
+	rep := mustRun(t, st, p, "full")
+	floor, ok := ReadCalibration(st, StampOf(p))
+	if !ok || rep.NoiseFloor != floor {
+		t.Fatalf("calibration: ok=%v floor=%v report=%v", ok, floor, rep.NoiseFloor)
+	}
+	other := StampOf(p)
+	other.ChunkerVersion++
+	if _, ok := ReadCalibration(st, other); ok {
+		t.Fatal("calibration leaked to another collection identity")
+	}
+}
+
+// --- write-side text cap: one cap per run, recorded in the stamp -----------
+
+// hermeticLocalEnv clears the operator knobs a local-sidecar test must not
+// inherit and pins the revision, so the stamp identity stays the same across
+// providers built from different /props answers.
+func hermeticLocalEnv(t *testing.T) {
+	t.Helper()
+	for _, k := range []string{"LEANKG_EMBED_MODEL", "LEANKG_EMBED_DIMS", "LEANKG_EMBED_TEXT_CAP"} {
+		t.Setenv(k, "")
+	}
+	t.Setenv("LEANKG_EMBED_REVISION", "test-local-pin")
+}
+
+// localSidecar is an httptest stand-in for the llama.cpp sidecar: /v1/embeddings
+// answers local-width vectors and records each input; /props reports n_ctx while
+// it is set, and 404s when it is 0.
+type localSidecar struct {
+	*httptest.Server
+	mu     sync.Mutex
+	nctx   int
+	inputs []string
+}
+
+func newLocalSidecar(t *testing.T, nctx int) *localSidecar {
+	t.Helper()
+	sc := &localSidecar{nctx: nctx}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/props", func(w http.ResponseWriter, r *http.Request) {
+		sc.mu.Lock()
+		n := sc.nctx
+		sc.mu.Unlock()
+		if n == 0 {
+			http.NotFound(w, r)
+			return
+		}
+		fmt.Fprintf(w, `{"model_path":"/models/bge-small-en-v1.5-f16.gguf","default_generation_settings":{"n_ctx":%d}}`, n)
+	})
+	mux.HandleFunc("/v1/embeddings", func(w http.ResponseWriter, r *http.Request) {
+		var body embeddingsRequest
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, "bad json", http.StatusBadRequest)
+			return
+		}
+		sc.mu.Lock()
+		sc.inputs = append(sc.inputs, body.Input...)
+		sc.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(openAIResponse(t, body, defaultDims))
+	})
+	sc.Server = httptest.NewServer(mux)
+	t.Cleanup(sc.Close)
+	return sc
+}
+
+func (sc *localSidecar) setNCtx(n int) {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	sc.nctx = n
+}
+
+// takeInputs returns the texts the sidecar was sent since the last call.
+func (sc *localSidecar) takeInputs() []string {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	out := sc.inputs
+	sc.inputs = nil
+	return out
+}
+
+// localRun runs against sc with a fresh local provider, so each call sees the
+// sidecar's /props as it is now (a provider caches a successful fingerprint).
+func localRun(t *testing.T, st *store.Store, sc *localSidecar, mode string) (Report, error) {
+	t.Helper()
+	p, err := newLocalProvider(sc.URL + "/v1")
+	if err != nil {
+		t.Fatalf("newLocalProvider: %v", err)
+	}
+	return Run(context.Background(), st, p, mode)
+}
+
+func storedStamp(t *testing.T, st *store.Store, modelID string) store.ModelStamp {
+	t.Helper()
+	cur, err := st.Stamp(modelID)
+	if err != nil || cur == nil {
+		t.Fatalf("stamp for %s: %v %v", modelID, cur, err)
+	}
+	return *cur
+}
+
+// budgetSeq is a provider labelled "local" whose sidecar budget (TextBudget)
+// answers budgets[i] on the i-th call and the last value after that: a /props
+// that changes while a run is in flight. It records the document texts sent.
+type budgetSeq struct {
+	inner   Provider
+	budgets []int
+	calls   int
+	texts   []string
+}
+
+func (b *budgetSeq) ModelID() string  { return b.inner.ModelID() }
+func (b *budgetSeq) Revision() string { return b.inner.Revision() }
+func (b *budgetSeq) Dimensions() int  { return b.inner.Dimensions() }
+func (b *budgetSeq) Distance() string { return b.inner.Distance() }
+func (b *budgetSeq) Provider() string { return "local" }
+
+func (b *budgetSeq) TextBudget() int {
+	i := min(b.calls, len(b.budgets)-1)
+	b.calls++
+	return b.budgets[i]
+}
+
+func (b *budgetSeq) Embed(ctx context.Context, kind TextKind, texts []string) ([][]float32, error) {
+	if kind == Document {
+		b.texts = append(b.texts, texts...)
+	}
+	return b.inner.Embed(ctx, kind, texts)
+}
+
+// (a) a recorded cap survives a /props outage: the incremental run embeds at
+// the stored cap and leaves the stamp alone.
+func TestWriteCapStoredCapSurvivesPropsOutage(t *testing.T) {
+	hermeticLocalEnv(t)
+	st := testStore(t)
+	seed(t, st, el("a::f1", "func f1() {}"))
+	sc := newLocalSidecar(t, 2048) // budget 2*2048-64 = 4032 runes
+	if _, err := localRun(t, st, sc, "full"); err != nil {
+		t.Fatalf("full: %v", err)
+	}
+	stamped := storedStamp(t, st, localModel())
+	if stamped.TextCap != 4032 {
+		t.Fatalf("stamp TextCap = %d, want 4032", stamped.TextCap)
+	}
+	sc.takeInputs()
+
+	sc.setNCtx(0) // /props now 404
+	seed(t, st, el("a::big", strings.Repeat("x", 9000)))
+	if _, err := localRun(t, st, sc, "incremental"); err != nil {
+		t.Fatalf("incremental with /props down: %v", err)
+	}
+	// The sidecar also sees the calibration probes; the big element is the
+	// longest planned text and must be cut to exactly the stored cap.
+	if got := maxRuneLen(sc.takeInputs()); got != 4032 {
+		t.Fatalf("longest planned text = %d runes, want the stored cap 4032", got)
+	}
+	if got := storedStamp(t, st, localModel()); got != stamped {
+		t.Fatalf("stamp changed on a /props outage: got %+v, want %+v", got, stamped)
+	}
+}
+
+// maxRuneLen is the rune length of the longest text (0 when there are none).
+func maxRuneLen(texts []string) int {
+	longest := 0
+	for _, s := range texts {
+		longest = max(longest, utf8.RuneCountInString(s))
+	}
+	return longest
+}
+
+// (b) with no stamp, no /props and no pin, the cap cannot be determined: the
+// run fails before any write, so there is no vector and no stamp row.
+func TestWriteCapRefusesWhenNothingDeterminesIt(t *testing.T) {
+	for _, mode := range []string{"incremental", "full"} {
+		t.Run(mode, func(t *testing.T) {
+			hermeticLocalEnv(t)
+			st := testStore(t)
+			seed(t, st, el("a::f1", "func f1() {}"))
+			sc := newLocalSidecar(t, 0) // /props 404, no pin
+			if _, err := localRun(t, st, sc, mode); err == nil {
+				t.Fatal("run with no derivable write cap must fail")
+			} else if !strings.Contains(err.Error(), "LEANKG_EMBED_TEXT_CAP") {
+				t.Fatalf("error must name the pin: %v", err)
+			}
+			if n := vectorCount(t, st, localModel()); n != 0 {
+				t.Fatalf("refused run wrote %d vectors", n)
+			}
+			if n := stampRows(t, st); n != 0 {
+				t.Fatalf("refused run wrote %d stamp rows", n)
+			}
+		})
+	}
+}
+
+// (c) the operator pin is the cap when the sidecar cannot say, and it is
+// recorded in the stamp.
+func TestWriteCapPinUsedWhenNoBudget(t *testing.T) {
+	hermeticLocalEnv(t)
+	t.Setenv("LEANKG_EMBED_TEXT_CAP", "1000")
+	st := testStore(t)
+	seed(t, st, el("a::big", strings.Repeat("x", 9000)))
+	sc := newLocalSidecar(t, 0)
+	if _, err := localRun(t, st, sc, "full"); err != nil {
+		t.Fatalf("full with pin and no /props: %v", err)
+	}
+	if got := storedStamp(t, st, localModel()).TextCap; got != 1000 {
+		t.Fatalf("stamp TextCap = %d, want 1000", got)
+	}
+	if got := maxRuneLen(sc.takeInputs()); got != 1000 {
+		t.Fatalf("longest planned text = %d runes, want the pinned 1000", got)
+	}
+}
+
+// (d) a sidecar whose n_ctx shrank below the recorded cap: an incremental run
+// refuses and names `leankg-embed full`; a full run rebuilds at the new cap.
+func TestWriteCapSidecarShrinkRefusesIncrementalAndFullRestamps(t *testing.T) {
+	hermeticLocalEnv(t)
+	st := testStore(t)
+	seed(t, st, el("a::f1", "func f1() {}"))
+	sc := newLocalSidecar(t, 4032) // budget 8000
+	if _, err := localRun(t, st, sc, "full"); err != nil {
+		t.Fatalf("full at 8000: %v", err)
+	}
+	if got := storedStamp(t, st, localModel()).TextCap; got != 8000 {
+		t.Fatalf("stamp TextCap = %d, want 8000", got)
+	}
+	before := vectorCount(t, st, localModel())
+
+	sc.setNCtx(512) // budget 960
+	seed(t, st, el("a::f2", "func f2() {}"))
+	if _, err := localRun(t, st, sc, "incremental"); err == nil || !strings.Contains(err.Error(), "leankg-embed full") {
+		t.Fatalf("incremental after n_ctx shrink: err = %v, want a refusal naming leankg-embed full", err)
+	}
+	if got := vectorCount(t, st, localModel()); got != before {
+		t.Fatalf("refused run touched vectors: had %d, now %d", before, got)
+	}
+	if got := storedStamp(t, st, localModel()).TextCap; got != 8000 {
+		t.Fatalf("refused run changed stamp TextCap to %d, want 8000", got)
+	}
+
+	if _, err := localRun(t, st, sc, "full"); err != nil {
+		t.Fatalf("full after n_ctx shrink: %v", err)
+	}
+	if got := storedStamp(t, st, localModel()).TextCap; got != 960 {
+		t.Fatalf("full re-stamp: TextCap = %d, want 960", got)
+	}
+}
+
+// (e) a sidecar budget above the recorded cap keeps the recorded cap and says so
+// in one note.
+func TestWriteCapKeepsStoredWhenSidecarBudgetGrows(t *testing.T) {
+	hermeticLocalEnv(t)
+	st := testStore(t)
+	seed(t, st, el("a::f1", "func f1() {}"))
+	sc := newLocalSidecar(t, 2048) // budget 4032
+	if _, err := localRun(t, st, sc, "full"); err != nil {
+		t.Fatalf("full at 4032: %v", err)
+	}
+	sc.takeInputs()
+
+	sc.setNCtx(8192) // budget 16320, clamped to 8000 for the general cap
+	seed(t, st, el("a::big", strings.Repeat("x", 9000)))
+	rep, err := localRun(t, st, sc, "incremental")
+	if err != nil {
+		t.Fatalf("incremental with a larger budget: %v", err)
+	}
+	if got := storedStamp(t, st, localModel()).TextCap; got != 4032 {
+		t.Fatalf("stamp TextCap = %d, want the recorded 4032 kept", got)
+	}
+	if got := maxRuneLen(sc.takeInputs()); got != 4032 {
+		t.Fatalf("longest planned text = %d runes, want the kept cap 4032", got)
+	}
+	if len(rep.Notes) != 1 || !strings.Contains(rep.Notes[0], "4032") {
+		t.Fatalf("notes = %q, want one note naming the kept cap 4032", rep.Notes)
+	}
+}
+
+// (f) a legacy stamp (text_cap 0, written before migration 17) is filled in with
+// the resolved cap, and its identity columns are byte-identical.
+func TestWriteCapFillsLegacyStampWithoutTouchingIdentity(t *testing.T) {
+	st := testStore(t)
+	seed(t, st, el("a::f1", "func f1() {}"))
+	p := overrideProvider{inner: Deterministic(8), modelID: "embeddinggemma-2", revision: "test:gemma-v1", dims: 8, provider: "openai"}
+	mustRun(t, st, p, "full")
+	legacy := storedStamp(t, st, p.ModelID())
+	legacy.TextCap = 0
+	if err := st.WriteStamp(legacy); err != nil {
+		t.Fatal(err)
+	}
+	seed(t, st, el("a::f2", "func f2() {}"))
+	mustRun(t, st, p, "incremental")
+
+	got := storedStamp(t, st, p.ModelID())
+	if got.TextCap != 8000 {
+		t.Fatalf("legacy stamp TextCap = %d, want 8000 filled in", got.TextCap)
+	}
+	got.TextCap = 0
+	if got != legacy {
+		t.Fatalf("identity changed by the fill-in: got %+v, want %+v", got, legacy)
+	}
+}
+
+// (g) /props answers OK for the run's first budget read and fails after it: the
+// whole run embeds at the one cap resolved at the start, never a mixed cut.
+func TestWriteCapOneCapPerRunWhenPropsFlips(t *testing.T) {
+	st := testStore(t)
+	seed(t, st,
+		el("a::b1", strings.Repeat("a", 2500)),
+		el("a::b2", strings.Repeat("b", 2500)),
+		el("a::b3", strings.Repeat("c", 2500)))
+	p := &budgetSeq{inner: Deterministic(8), budgets: []int{2000, 0}}
+	rep := mustRun(t, st, p, "full")
+	if rep.Truncations != 3 || len(p.texts) != 3 {
+		t.Fatalf("got Truncations=%d, %d texts; want 3 and 3", rep.Truncations, len(p.texts))
+	}
+	for i, text := range p.texts {
+		if n := utf8.RuneCountInString(text); n != 2000 {
+			t.Fatalf("text %d cut at %d runes, want the run's one cap of 2000 (a /props failure mid-run must not change it)", i, n)
+		}
+	}
+	if got := storedStamp(t, st, p.ModelID()).TextCap; got != 2000 {
+		t.Fatalf("stamp TextCap = %d, want 2000", got)
+	}
+}

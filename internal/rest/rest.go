@@ -1,0 +1,371 @@
+// Package rest exposes the engine over plain stdlib net/http (Go ≥1.22
+// routing patterns; no framework — rewrite doc §6.7). Endpoints:
+//
+//	GET  /health                 liveness
+//	GET  /api/v1/status          status tool payload
+//	POST /api/v1/query           query tool payload (ladder + rungs + memory)
+//	POST /api/v1/import          import tool payload (index / memory writes)
+//	POST /api/v1/memory/banks/{bank}/memories   hindsight-shaped retain
+//	POST /api/v1/memory/banks/{bank}/recall     hindsight-shaped recall
+//
+// The memory HTTP surface is the FR-ZCP-07 remainder contract (upstream
+// memory.backend:"mcp" evidence). Bodies: retain = TOP-LEVEL
+// {entries:[{content, id?, metadata?}], through_user_turn} — entries carry
+// "content" (NOT "text") — and recall = {query, limit}.
+package rest
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"strconv"
+	"strings"
+
+	"github.com/FreePeak/LeanKG/internal/core"
+	"github.com/FreePeak/LeanKG/internal/errs"
+	"github.com/FreePeak/LeanKG/internal/federation"
+	"github.com/FreePeak/LeanKG/internal/memory"
+	"github.com/FreePeak/LeanKG/internal/orgknowledge"
+)
+
+// Handler builds the REST mux over an engine.
+func Handler(engine *core.Engine, mem *memory.Memory, opts ...HandlerOption) http.Handler {
+	mux := http.NewServeMux()
+	var cfg handlerConfig
+	for _, o := range opts {
+		o(&cfg)
+	}
+	mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	})
+	mux.HandleFunc("GET /api/v1/status", func(w http.ResponseWriter, r *http.Request) {
+		out, err := engine.Status(r.Context())
+		if err != nil {
+			writeErr(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, out)
+	})
+	mux.HandleFunc("POST /api/v1/query", func(w http.ResponseWriter, r *http.Request) {
+		var req core.QueryRequest
+		if !decode(w, r, &req) {
+			return
+		}
+		out, err := engine.Query(r.Context(), req)
+		if err != nil {
+			writeErr(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, out)
+	})
+	mux.HandleFunc("POST /api/v1/import", func(w http.ResponseWriter, r *http.Request) {
+		var req core.ImportRequest
+		if !decode(w, r, &req) {
+			return
+		}
+		out, err := engine.Import(r.Context(), req)
+		if err != nil {
+			writeErr(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, out)
+	})
+	mux.HandleFunc("POST /api/v1/session/read", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Command   string `json:"command"` // recall | canvas
+			SessionID string `json:"session_id"`
+			NodeID    string `json:"node_id"`
+		}
+		if !decode(w, r, &body) {
+			return
+		}
+		out, err := engine.SessionRead(body.Command, body.SessionID, body.NodeID)
+		if err != nil {
+			writeErr(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, out)
+	})
+	mux.HandleFunc("POST /api/v1/ontology/match", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Catalog string `json:"catalog"` // path to the concept catalog JSON
+		}
+		if !decode(w, r, &body) {
+			return
+		}
+		out, err := engine.OntologyMatch(body.Catalog)
+		if err != nil {
+			writeErr(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, out)
+	})
+	mux.HandleFunc("GET /api/v1/ontology/matches", func(w http.ResponseWriter, r *http.Request) {
+		out, err := engine.OntologyMatches()
+		if err != nil {
+			writeErr(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, out)
+	})
+	// FR-ZCP org-knowledge reads (Rust /api/v2 routes; the Go envelope is the
+	// existing writeJSON payload shape). Param defaults follow the Rust
+	// handlers: env=production, limit=10.
+	org := orgknowledge.New(engine.Store())
+	mux.HandleFunc("GET /api/v2/incidents", func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		env := q.Get("env")
+		if env == "" {
+			env = "production"
+		}
+		limit, _ := strconv.Atoi(q.Get("limit"))
+		if limit == 0 {
+			limit = 10
+		}
+		incidents, err := org.QueryIncidents(q.Get("service"), q.Get("pattern"), env, limit)
+		if err != nil {
+			writeErr(w, err)
+			return
+		}
+		// A list answer says whether there IS a list to return: `null` and
+		// `[]` are different answers ("never configured" and "configured and
+		// found nothing"), and the note names the causes an empty list can
+		// have at this route without pretending to pick between them.
+		writeJSON(w, http.StatusOK, map[string]any{
+			"incidents": core.NonNil(incidents),
+			"note": "no incidents recorded for this filter; an empty list means either no incident store is " +
+				"configured (`leankg incident import` to add one) or nothing matched the filter",
+		})
+	})
+	mux.HandleFunc("GET /api/v2/env/diff", func(w http.ResponseWriter, r *http.Request) {
+		conflicts, err := org.FindEnvConflicts(r.URL.Query().Get("service"))
+		if err != nil {
+			writeErr(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"conflicts": conflicts})
+	})
+	mux.HandleFunc("GET /api/v2/service/context", func(w http.ResponseWriter, r *http.Request) {
+		env := r.URL.Query().Get("env")
+		if env == "" {
+			env = "production"
+		}
+		ctx, err := org.ServiceContext(r.URL.Query().Get("service"), env)
+		if err != nil {
+			writeErr(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, ctx)
+	})
+	// Federation receiver (#372): POST /api/v2/graph/push + GET /api/v2/graph,
+	// per-project (routeByProject wraps each project handler), caller-authenticated
+	// with Contributor+ required to write.
+	federation.Register(mux, engine.Store(), engine.ProjectDir())
+	if mem != nil {
+		mux.HandleFunc("POST /api/v1/memory/banks/{bank}/memories", func(w http.ResponseWriter, r *http.Request) {
+			bank := r.PathValue("bank")
+			// Hindsight-shaped retain body: TOP-LEVEL through_user_turn
+			// cursor; entries carry {"content", optional "id", "metadata"}
+			// (NOT "text" — pinned here and in tests so harness authors
+			// don't hit the same mismatch twice).
+			var body struct {
+				// Pointer: the entries array must be PRESENT. With a plain
+				// slice, `{}`, `{"items":[...]}` (the name the
+				// hindsight-compat mount on this same listener uses) and an
+				// empty body all decoded to a nil slice and answered
+				// `200 {"ok":true,"retained":0}`: a client whose field name did
+				// not match got a successful retain of nothing, with no way to
+				// tell. Absent is not zero; only an EXPLICIT `"entries": []` is a
+				// legitimate no-op.
+				Entries *[]memory.Entry `json:"entries"`
+				// Pointer: an ABSENT cursor means "no gate" (append, like the
+				// hindsight mount). Decoded as int it read as 0, which the
+				// cursor gate treats as already retained — every cursor-less
+				// retain was dropped while answering ok (RS-07).
+				ThroughUserTurn *int `json:"through_user_turn"`
+			}
+			if !decode(w, r, &body) {
+				return
+			}
+			if body.Entries == nil {
+				writeJSON(w, http.StatusBadRequest, map[string]any{
+					"error": "entries is required (an explicit \"entries\": [] is a valid no-op; " +
+						"this route reads `entries`, not the hindsight-compat mount's `items`)",
+				})
+				return
+			}
+			// Trust boundary: an empty-content entry is permanently
+			// unrecallable (zero-match filtering) — reject rather than
+			// silently swallow it.
+			for i, e := range *body.Entries {
+				if strings.TrimSpace(e.Content) == "" {
+					writeJSON(w, http.StatusBadRequest, map[string]any{
+						"error": fmt.Sprintf("entries[%d].content is empty — empty entries would be unrecallable", i),
+					})
+					return
+				}
+			}
+			var res memory.RetainResult
+			if body.ThroughUserTurn == nil {
+				if err := mem.RetainRawCtx(r.Context(), bank, *body.Entries); err != nil {
+					writeErr(w, err)
+					return
+				}
+				res = memory.RetainResult{Bank: bank, Written: len(*body.Entries)}
+			} else {
+				var err error
+				if res, err = mem.RetainCtx(r.Context(), bank, *body.Entries, *body.ThroughUserTurn); err != nil {
+					writeErr(w, err)
+					return
+				}
+			}
+			writeJSON(w, http.StatusOK, map[string]any{
+				"ok": true, "retained": res.Written, "skipped": res.Skipped,
+				"retained_through_user_turn": res.RetainedThroughUserTurn,
+			})
+		})
+		mux.HandleFunc("POST /api/v1/memory/banks/{bank}/recall", func(w http.ResponseWriter, r *http.Request) {
+			bank := r.PathValue("bank")
+			var body struct {
+				Query string `json:"query"`
+				Limit int    `json:"limit"`
+			}
+			if !decode(w, r, &body) {
+				return
+			}
+			entries, err := mem.RecallCtx(r.Context(), bank, body.Query, body.Limit)
+			if err != nil {
+				writeErr(w, err)
+				return
+			}
+			// The list is never null: an empty bank and a bank that was never
+			// configured are different answers, and the note says which is
+			// which at this route.
+			writeJSON(w, http.StatusOK, map[string]any{
+				"entries": core.NonNil(entries),
+				"note": "bank " + bank + " holds nothing matching this query; recall matches on query tokens, " +
+					"and an empty query matches nothing",
+			})
+		})
+		// FR-ZCP-07 session surface (hindsight-shaped): retain with a
+		// session-keyed cursor, recall merged across the scope's banks, and the
+		// first-turn <memories> injection read. (Mem275 proposed
+		// `memories:inject`; Go ServeMux segments keep no colon convention, so
+		// the read lives at /inject — same semantics, cleaner route.)
+		mux.HandleFunc("POST /api/v1/memory/session/retain", func(w http.ResponseWriter, r *http.Request) {
+			var body struct {
+				SessionID               string   `json:"session_id"`
+				Turns                   []string `json:"turns"`
+				RetainedThroughUserTurn int      `json:"retained_through_user_turn"`
+				Scope                   string   `json:"scope"`
+				CWD                     string   `json:"cwd"`
+				Bank                    string   `json:"bank"`
+				// K2: first-class tags on the retain path, so a later tag-scoped
+				// recall can match what this session wrote.
+				Tags []string `json:"tags"`
+			}
+			if !decode(w, r, &body) {
+				return
+			}
+			scope, err := memory.ParseScope(body.Scope)
+			if err != nil {
+				writeErr(w, err)
+				return
+			}
+			res, err := mem.SessionRetainCtx(r.Context(), scope, body.CWD, body.Bank, body.SessionID, body.Turns, body.RetainedThroughUserTurn, body.Tags)
+			if err != nil {
+				writeErr(w, err)
+				return
+			}
+			writeJSON(w, http.StatusOK, res)
+		})
+		mux.HandleFunc("POST /api/v1/memory/session/recall", func(w http.ResponseWriter, r *http.Request) {
+			var body struct {
+				Query string `json:"query"`
+				Limit int    `json:"limit"`
+				Scope string `json:"scope"`
+				CWD   string `json:"cwd"`
+				Bank  string `json:"bank"`
+			}
+			if !decode(w, r, &body) {
+				return
+			}
+			scope, err := memory.ParseScope(body.Scope)
+			if err != nil {
+				writeErr(w, err)
+				return
+			}
+			banks, entries, err := mem.SessionRecallCtx(r.Context(), scope, body.CWD, body.Bank, body.Query, body.Limit)
+			if err != nil {
+				writeErr(w, err)
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]any{
+				"banks": banks, "count": len(entries), "memories": memory.RankEntries(entries),
+			})
+		})
+		injectHandle := func(w http.ResponseWriter, r *http.Request, bank string) {
+			q := r.URL.Query()
+			scope, err := memory.ParseScope(q.Get("scope"))
+			if err != nil {
+				writeErr(w, err)
+				return
+			}
+			text, injectedIDs, total, err := mem.FirstTurnMemoriesWithIDs(r.Context(), scope, q.Get("cwd"), bank, q.Get("query"))
+			if err != nil {
+				writeErr(w, err)
+				return
+			}
+			// injected_ids and total are additive: the count and the text are
+			// unchanged, so an older caller is unaffected. injected_ids lets a
+			// caller report which rows it actually placed in the prompt; total
+			// is how many rows the recall FOUND, so "the block shows 8" no
+			// longer reads as "there are 8" (FR-SMA-06's marker half — the
+			// block also names the hidden count in text).
+			writeJSON(w, http.StatusOK, map[string]any{
+				"count": len(injectedIDs), "text": text, "injected_ids": injectedIDs, "total": total,
+			})
+		}
+		mux.HandleFunc("GET /api/v1/memory/banks/{bank}/inject", func(w http.ResponseWriter, r *http.Request) {
+			injectHandle(w, r, r.PathValue("bank"))
+		})
+		// The bank-less form is what an external hook uses: a hook cannot know
+		// the mnemopi bank name (it embeds a hash of the cwd), and guessing one
+		// reads the wrong bank silently. An empty bank means the server's own
+		// default for the scope, which is exactly what the hook wants.
+		mux.HandleFunc("GET /api/v1/memory/inject", func(w http.ResponseWriter, r *http.Request) {
+			injectHandle(w, r, "")
+		})
+	}
+	if cfg.hindsightCompat && mem != nil {
+		registerHindsightCompat(mux, mem)
+	}
+	return mux
+}
+
+func writeJSON(w http.ResponseWriter, code int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+// writeErr renders a failed REST call. An error carrying a catalog code
+// (internal/errs) also exposes it as `code`, so clients branch on the stable
+// token instead of matching prose (FR-ZCP-12).
+func writeErr(w http.ResponseWriter, err error) {
+	body := map[string]any{"error": err.Error()}
+	var coded *errs.Error
+	if errors.As(err, &coded) {
+		body["code"] = coded.Code()
+	}
+	writeJSON(w, http.StatusBadRequest, body)
+}
+
+func decode[T any](w http.ResponseWriter, r *http.Request, into *T) bool {
+	if err := json.NewDecoder(r.Body).Decode(into); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON body: " + err.Error()})
+		return false
+	}
+	return true
+}
