@@ -1,0 +1,154 @@
+package main
+
+import (
+	"context"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"os"
+	"time"
+
+	"github.com/FreePeak/LeanKG/internal/cliexit"
+	"github.com/FreePeak/LeanKG/internal/dashboard"
+	"github.com/FreePeak/LeanKG/internal/sessionlink/all"
+	"github.com/FreePeak/LeanKG/internal/telemetry"
+)
+
+const defaultDashboardAddr = "127.0.0.1:9701"
+
+// dashboardMode is what `leankg dashboard` runs: the usage tables or the web
+// dashboard. It is decided from the PARSED flags — the mode is a property of
+// the values, never of the spelling of the command line.
+type dashboardMode int
+
+const (
+	// dashboardModeWeb serves the dashboard and opens the browser. It is the
+	// default (DS-20): a bare `leankg dashboard` starts the server, so the
+	// web mode is the zero value — an unset mode is never silently the
+	// tables.
+	dashboardModeWeb dashboardMode = iota
+	// dashboardModeTables renders the usage buckets as text or JSON.
+	dashboardModeTables
+)
+
+// dashboardFlags is the ONE flag set of `leankg dashboard`: the usage tables
+// and the web dashboard read the same definitions, so a single invocation
+// can carry both (`leankg dashboard --addr 127.0.0.1:9701 --no-open
+// --format text`). Before this set existed, the web flags lived in one
+// FlagSet and the table flags in another, and the choice between them was
+// made by scanning argv for "--format" — so the documented invocation sent
+// the whole argv to the table-only FlagSet and died with "flag provided but
+// not defined: -addr".
+type dashboardFlags struct {
+	addr        string
+	noOpen      bool
+	allowRemote bool
+	token       string
+	project     string
+	since       string
+	format      string
+	// mode is the parsed mode: the tables when --format was given, the web
+	// dashboard otherwise (DS-20).
+	mode dashboardMode
+}
+
+// parseDashboardFlags parses the one `leankg dashboard` flag set. Flags may
+// appear before or after positionals, as in every other verb here, and a
+// positional argument is refused. A parse error exits 2 with the usage.
+func parseDashboardFlags(args []string) (*dashboardFlags, error) {
+	fs := flag.NewFlagSet("dashboard", flag.ContinueOnError)
+	f := &dashboardFlags{}
+	fs.StringVar(&f.addr, "addr", defaultDashboardAddr, "listen address (loopback unless --allow-remote)")
+	fs.BoolVar(&f.noOpen, "no-open", false, "do not open the browser")
+	fs.BoolVar(&f.allowRemote, "allow-remote", false, "serve beyond loopback; every request needs --token")
+	fs.StringVar(&f.token, "token", "", "bearer token required with --allow-remote")
+	// The two modes read different ledgers, so --project means what it
+	// always meant in each: the project directory the tables are read from,
+	// and the project filter the dashboard reports are narrowed by.
+	fs.StringVar(&f.project, "project", "", "project directory (tables) or project filter (dashboard)")
+	fs.StringVar(&f.since, "since", "", "window: <N>h, <N>d or <N>w (e.g. 24h, 7d, 30d); default all time")
+	fs.StringVar(&f.format, "format", "", "output format: text|json (prints the usage tables instead of serving the dashboard)")
+	if _, err := parseInterspersed("dashboard", fs, args, 0); err != nil {
+		return nil, err
+	}
+	// Visit reports the flags that were actually given, so the mode comes
+	// from the parsed values and not from a scan of argv: --format=text and
+	// --format "" both ask for the tables, no --format asks for the server.
+	f.mode = dashboardModeWeb
+	fs.Visit(func(fl *flag.Flag) {
+		if fl.Name == "format" {
+			f.mode = dashboardModeTables
+		}
+	})
+	return f, nil
+}
+
+// cmdDashboardWeb starts the loopback dashboard server and opens the browser.
+func cmdDashboardWeb(ctx context.Context, f *dashboardFlags) error {
+	if err := runDashboardWeb(ctx, f, os.Stdout, dashboard.OpenBrowser); err != nil {
+		fmt.Fprintln(os.Stderr, "dashboard:", err)
+		return cliexit.Code(1)
+	}
+	return nil
+}
+
+// runDashboardWeb serves the dashboard until ctx is done or SIGINT/SIGTERM
+// arrives. opener is called with the URL unless --no-open is given.
+func runDashboardWeb(ctx context.Context, f *dashboardFlags, out io.Writer, opener func(ctx context.Context, url string) error) error {
+	if err := dashboard.CheckListen(f.addr, f.allowRemote, f.token); err != nil {
+		return err
+	}
+	if f.token != "" && !f.allowRemote {
+		fmt.Fprintln(os.Stderr, "dashboard: --token is ignored without --allow-remote (loopback needs no token)")
+	}
+	start, err := dashboard.ParseSince(f.since, time.Now())
+	if err != nil {
+		return fmt.Errorf("--since: %w", err)
+	}
+	home := telemetry.Home()
+	srv, err := dashboard.New(dashboard.Options{
+		Home:        home,
+		Since:       start,
+		Project:     f.project,
+		Adapters:    all.Adapters(),
+		Token:       f.token,
+		AllowRemote: f.allowRemote,
+	})
+	if err != nil {
+		return err
+	}
+	ls, err := bindAll(endpoint{addr: f.addr, h: srv.Handler()})
+	if err != nil {
+		return err
+	}
+	url := "http://" + ls[0].ln.Addr().String() + "/"
+
+	ctx, stop := context.WithCancel(ctx)
+	defer stop()
+	runDone := make(chan struct{})
+	go func() {
+		defer close(runDone)
+		srv.Run(ctx)
+	}()
+	// Serving starts before the opener runs, so the opener can reach the URL.
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- runServers(ctx, ls...) }()
+
+	fmt.Fprintf(out, "LeanKG dashboard: %s (ledger %s)\n", url, telemetry.DBPath(home))
+	if f.allowRemote {
+		fmt.Fprintln(out, "remote mode: every request needs 'Authorization: Bearer <token>'")
+	}
+	if !f.noOpen && opener != nil {
+		if err := opener(ctx, url); err != nil && !errors.Is(err, dashboard.ErrNoDisplay) {
+			fmt.Fprintln(os.Stderr, "dashboard: could not open a browser:", err)
+		}
+	}
+
+	serveErr := <-serveDone
+	stop()
+	<-runDone
+	return serveErr
+}
+
+func errNotImplemented(what string) error { return fmt.Errorf("%s: not implemented yet", what) }

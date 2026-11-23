@@ -1,0 +1,901 @@
+package index
+
+import (
+	"context"
+	"regexp"
+	"slices"
+	"strconv"
+	"strings"
+
+	"github.com/FreePeak/LeanKG/internal/store"
+)
+
+// maxContent bounds one element's stored content, in characters.
+const maxContent = 8000
+
+// match is one raw regex hit before line-range resolution.
+type match struct {
+	kind   string // "function", "method", "type", "class", "constructor", "constant", "doc"
+	name   string
+	line   int    // 1-based
+	recv   string // Go receiver type
+	indent int    // Python indentation; Markdown heading level
+}
+
+// indexedElem is an extracted element before conversion to store.Element.
+type indexedElem struct {
+	name    string
+	etype   string // function | method | type | class | constructor | constant | doc
+	lang    string
+	start   int // 1-based
+	end     int
+	content string
+	docLen  int // bytes of content that are the prepended leading doc block (RS-10)
+	parent  int // index into the same slice, -1 = none
+	qn      string
+	recv    string   // Go method receiver type
+	calls   []string // grammar-derived call targets (objc message sends)
+}
+
+// Package-level compiled regexes (documented ceiling: regex extraction,
+// tree-sitter port is W2).
+var (
+	// Go
+	goFuncRe = regexp.MustCompile(`^func\s+(?:\(([^)]*)\)\s*)?([A-Za-z_]\w*)\s*\(`)
+	goTypeRe = regexp.MustCompile(`^type\s+([A-Za-z_]\w*)\s+(?:struct|interface)\b`)
+	// Rust
+	rsFnRe   = regexp.MustCompile(`^\s*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+([A-Za-z_]\w*)`)
+	rsTypeRe = regexp.MustCompile(`^\s*(?:pub(?:\([^)]*\))?\s+)?(struct|enum|trait)\s+([A-Za-z_]\w*)`)
+	rsImplRe = regexp.MustCompile(`^\s*impl(?:<[^>]*>)?\s+(?:[^{]*\sfor\s+)?([A-Za-z_][\w:]*)`)
+	// Python
+	pyFuncRe  = regexp.MustCompile(`^(\s*)(?:async\s+)?def\s+([A-Za-z_]\w*)`)
+	pyClassRe = regexp.MustCompile(`^(\s*)(?:async\s+)?class\s+([A-Za-z_]\w*)`)
+	// TS/JS/JSX/TSX
+	tsFuncRe   = regexp.MustCompile(`^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\b\s*\*?\s*([A-Za-z_]\w*)`)
+	tsClassRe  = regexp.MustCompile(`^\s*(?:export\s+)?(?:default\s+)?(?:abstract\s+)?class\s+([A-Za-z_]\w*)`)
+	tsArrowRe  = regexp.MustCompile(`^\s*(?:export\s+)?const\s+([A-Za-z_]\w*)\s*(?::[^=]+)?=\s*(?:async\s+)?(?:\([^)]*\)|[A-Za-z_]\w*)\s*=>`)
+	tsFnExprRe = regexp.MustCompile(`^\s*(?:export\s+)?const\s+([A-Za-z_]\w*)\s*(?::[^=]+)?=\s*(?:async\s+)?function\b`)
+	// Markdown ATX headings (levels 1-4)
+	mdHeadingRe = regexp.MustCompile(`^(#{1,4})\s+(.*\S)\s*$`)
+	// Java
+	javaTypeRe   = regexp.MustCompile(`^\s*(?:(?:public|protected|private|static|final|abstract|sealed|strictfp|native|synchronized|default)\s+)*(class|interface|enum|record|@interface)\s+([A-Za-z_]\w*)`)
+	javaMethodRe = regexp.MustCompile(`^\s*(?:(?:public|protected|private|static|final|abstract|synchronized|native|default|strictfp)\s+)*(?:(?:<[^>]*>|[\w$<>\[\].]+)\s+)*([A-Za-z_$][\w$]*)\s*\([^;{)]*\)\s*(?:throws [\w,.\s]+)?\{`)
+	// Kotlin
+	ktTypeRe = regexp.MustCompile(`^\s*(?:(?:public|private|internal|protected|open|final|abstract|sealed|data|value|annotation|inner|enum)\s+)*(class|interface|object)\s+([A-Za-z_]\w*)`)
+	ktFuncRe = regexp.MustCompile(`^\s*(?:(?:public|private|internal|protected|open|final|abstract|override|inline|noinline|crossinline|operator|infix|tailrec|external|suspend|expect|actual)\s+)*fun\s+(?:<[^>]*>\s*)?(?:[\w.<>\[\]?]+\s*\.\s*)?([A-Za-z_]\w*)\s*\(`)
+	// Swift
+	swiftFuncRe = regexp.MustCompile(`^\s*(?:(?:public|private|internal|open|fileprivate|static|class|final|mutating|nonmutating|override|convenience|required|weak|unowned|lazy)\s+)*func\s+([A-Za-z_]\w*)\s*[(<]`)
+	swiftTypeRe = regexp.MustCompile(`^\s*(?:(?:public|private|internal|open|fileprivate|final|indirect)\s+)*(struct|class|enum|protocol|actor)\s+([A-Za-z_]\w*)`)
+	// Objective-C
+	objcTypeRe   = regexp.MustCompile(`^\s*@(interface|implementation|protocol)\s+([A-Za-z_]\w*)`)
+	objcMethodRe = regexp.MustCompile(`^\s*([+-])\s*\(([^)]*)\)\s*([A-Za-z_]\w*)`)
+	// Dart
+	dartTypeRe = regexp.MustCompile(`^\s*(?:(?:abstract|sealed|final|base|interface|mixin|external|required|const|covariant)\s+)*(class|enum|mixin)\s+([A-Za-z_]\w*)`)
+	dartFuncRe = regexp.MustCompile(`^\s*(?:[\w$<>,?\s]+\s+)?([A-Za-z_$][\w$]*)\s*\([^;{)]*\)\s*(?:(?:async|sync\s*\*)\s*)?(?:\{|=>)`)
+	// Dart constructors: "Factory()", "Factory.named(int x)", "const
+	// Factory.zero()", "factory Factory.create() => ...". The class name is
+	// UpperCamel in Dart, which keeps ordinary lower-case call statements
+	// ("setState(...)") out; a static-method call statement looks identical
+	// to a named-constructor declaration, so those stay a documented ceiling
+	// of the regex tier (the tstree build is exact).
+	dartCtorRe = regexp.MustCompile(`^\s*(?:(?:const|factory|external)\s+)*([A-Z]\w*)(?:\.(\w+))?\s*\(`)
+	// dartEnumConstantRe accepts exactly one enum value name.
+	dartEnumConstantRe = regexp.MustCompile(`^[A-Za-z_$][\w$]*$`)
+)
+
+// extractFileAs extracts elements from one file's content as the given
+// language tag (empty or unknown tags yield no elements). The only error is
+// ctx's: a cancelled ctx stops the tree-sitter tier and is returned, while a
+// grammar that fails to parse falls back to regex.
+func extractFileAs(ctx context.Context, rel string, src []byte, lang string) (fileElements, error) {
+	lines := strings.Split(strings.TrimSuffix(string(src), "\n"), "\n")
+
+	// Tree-sitter tier first (tstree build only): richer symbol extraction
+	// for the bundled grammars, with real end lines. No grammar for the
+	// language ⇒ nil ⇒ regex fallback below.
+	defs, err := tsExtract(ctx, src, lang)
+	if cerr := ctx.Err(); cerr != nil {
+		return fileElements{}, cerr
+	}
+	if err == nil && len(defs) > 0 {
+		fe := fileElements{rel: rel}
+		for _, d := range defs {
+			end := d.EndLine
+			if end < d.StartLine {
+				end = d.StartLine
+			}
+			e := indexedElem{
+				name: d.Name, etype: d.Kind, lang: lang,
+				start: d.StartLine, end: end, parent: -1,
+			}
+			if d.Kind == "constructor" || d.Kind == "constant" {
+				// The grammar names a constructor after the constructor, not the
+				// class (and an enum value carries no type at all); recv carries
+				// the owning type so qualify() spells "<file>::Class.ctor" and
+				// "<file>::Enum.value" without depending on line-based parent
+				// detection (a one-line body has none).
+				e.recv = d.Owner
+			}
+			if d.Kind == "method" && d.Owner != "" {
+				// A Go method's owning type is its RECEIVER, and the receiver
+				// is not an enclosing node — a Go method is a sibling of its
+				// type, not a child of it — so line-based parent detection
+				// cannot find it. Without recv the method's qualified name was
+				// "<file>::Method" instead of "<file>::Type.Method", and the
+				// same repository indexed under `-tags tstree` answered
+				// DIFFERENT qualified names than the shipped CGO-free build.
+				e.recv = d.Owner
+			}
+			fe.elements = append(fe.elements, e)
+		}
+		assignParents(fe.elements)
+		qualify(fe)
+		boundContent(fe.elements, lines)
+		// Grammar-derived call sites seed "calls" edges in relationships().
+		if err := tsAttributeCalls(ctx, src, lang, fe.elements); err != nil {
+			return fileElements{}, err
+		}
+		return fe, nil
+	}
+
+	var ms []match
+	switch lang {
+	case "go":
+		ms = matchGo(lines)
+	case "rust":
+		ms = matchRust(lines)
+	case "py":
+		ms = matchPython(lines)
+	case "ts", "tsx", "js", "jsx":
+		ms = matchTS(lines)
+	case "md":
+		ms = matchMarkdown(lines)
+	case "java":
+		ms = matchJava(lines)
+	case "kotlin":
+		ms = matchKotlin(lines)
+	case "swift":
+		ms = matchSwift(lines)
+	case "objc":
+		ms = matchObjC(lines)
+	case "dart":
+		ms = matchDart(lines)
+	default:
+		// Expanded language set (extract_langexp.go); claims only its own ids
+		// and reports ok=false otherwise, so built-ins above are untouched.
+		ms, _ = matchLangExp(lang, lines)
+	}
+	if len(ms) == 0 {
+		return fileElements{rel: rel}, nil
+	}
+
+	ends := make([]int, len(ms))
+	switch lang {
+	case "py":
+		for i, m := range ms {
+			ends[i] = pyBodyEnd(lines, m)
+		}
+	case "md":
+		// A section extends to just before the next heading of the SAME or a
+		// HIGHER level. The old rule (the next strictly HIGHER level) let a
+		// `##` swallow every section that followed it, so a document's text
+		// was stored once per heading that preceded it.
+		ends = mdSectionEnds(ms, len(lines))
+	default:
+		for i := range ms {
+			ends[i] = len(lines)
+			if i+1 < len(ms) {
+				ends[i] = ms[i+1].line - 1
+			}
+			if ends[i] < ms[i].line {
+				ends[i] = ms[i].line
+			}
+			// A brace-bounded element ends at its closing brace. Lines between
+			// that brace and the next declaration belong to the next one (its doc
+			// comment), so they are not part of this element.
+			if c := closingBraceLine(lines, lang, ms[i].line, ends[i]); c > 0 {
+				ends[i] = c
+			}
+			ends[i] = trimTrailingComments(lines, ms[i].line, ends[i])
+		}
+	}
+
+	fe := fileElements{rel: rel}
+	for i, m := range ms {
+		fe.elements = append(fe.elements, indexedElem{
+			name: m.name, etype: m.kind, lang: lang,
+			start: m.line, end: ends[i], parent: -1, recv: m.recv,
+		})
+	}
+	assignParents(fe.elements)
+	qualify(fe)
+	if lang == "md" {
+		mdUniqueNames(fe.elements)
+		markdownContent(fe.elements, ms, ends, lines)
+		return fe, nil
+	}
+	boundContent(fe.elements, lines)
+	return fe, nil
+}
+
+// fileElements holds the extraction output for one file.
+type fileElements struct {
+	rel      string
+	elements []indexedElem
+}
+
+// toStore converts extracted elements to store rows.
+func (fe fileElements) toStore() []store.Element {
+	out := make([]store.Element, len(fe.elements))
+	for i, e := range fe.elements {
+		out[i] = store.Element{
+			QualifiedName: e.qn, ElementType: e.etype, Name: e.name,
+			FilePath: fe.rel, LineStart: e.start, LineEnd: e.end,
+			Language: e.lang, Content: e.content,
+		}
+		if e.parent >= 0 {
+			out[i].ParentQualified = fe.elements[e.parent].qn
+		}
+	}
+	return out
+}
+
+func matchGo(lines []string) []match {
+	var ms []match
+	for i, l := range lines {
+		if m := goFuncRe.FindStringSubmatch(l); m != nil {
+			kind, recv := "function", ""
+			if strings.TrimSpace(m[1]) != "" {
+				kind, recv = "method", goRecvType(m[1])
+			}
+			ms = append(ms, match{kind: kind, name: m[2], line: i + 1, recv: recv})
+			continue
+		}
+		if m := goTypeRe.FindStringSubmatch(l); m != nil {
+			ms = append(ms, match{kind: "type", name: m[1], line: i + 1})
+		}
+	}
+	return ms
+}
+
+// goRecvType pulls the type out of a receiver like "*Srv", "_ Srv", "s *Srv".
+func goRecvType(recv string) string {
+	f := strings.Fields(strings.TrimSpace(recv))
+	return strings.TrimPrefix(f[len(f)-1], "*")
+}
+
+func matchRust(lines []string) []match {
+	var ms []match
+	for i, l := range lines {
+		if m := rsFnRe.FindStringSubmatch(l); m != nil {
+			ms = append(ms, match{kind: "function", name: m[1], line: i + 1})
+			continue
+		}
+		if m := rsTypeRe.FindStringSubmatch(l); m != nil {
+			ms = append(ms, match{kind: "type", name: m[2], line: i + 1})
+			continue
+		}
+		if m := rsImplRe.FindStringSubmatch(l); m != nil {
+			name := m[1]
+			if p := strings.LastIndex(name, "::"); p >= 0 {
+				name = name[p+2:]
+			}
+			ms = append(ms, match{kind: "type", name: name, line: i + 1})
+		}
+	}
+	return ms
+}
+func matchPython(lines []string) []match {
+	var ms []match
+	for i, l := range lines {
+		if m := pyFuncRe.FindStringSubmatch(l); m != nil {
+			ms = append(ms, match{kind: "function", name: m[2], line: i + 1, indent: len(m[1])})
+			continue
+		}
+		if m := pyClassRe.FindStringSubmatch(l); m != nil {
+			ms = append(ms, match{kind: "class", name: m[2], line: i + 1, indent: len(m[1])})
+		}
+	}
+	return ms
+}
+
+// pyBodyEnd returns the last line of an indentation-bounded Python block.
+func pyBodyEnd(lines []string, m match) int {
+	end := m.line
+	for i := m.line; i < len(lines); i++ { // lines[i] is line i+1
+		l := lines[i]
+		if strings.TrimSpace(l) == "" {
+			continue
+		}
+		if len(l)-len(strings.TrimLeft(l, " \t")) <= m.indent {
+			break
+		}
+		end = i + 1
+	}
+	return end
+}
+
+func matchTS(lines []string) []match {
+	var ms []match
+	for i, l := range lines {
+		switch {
+		case tsFuncRe.MatchString(l):
+			ms = append(ms, match{kind: "function", name: tsFuncRe.FindStringSubmatch(l)[1], line: i + 1})
+		case tsClassRe.MatchString(l):
+			ms = append(ms, match{kind: "class", name: tsClassRe.FindStringSubmatch(l)[1], line: i + 1})
+		case tsArrowRe.MatchString(l):
+			ms = append(ms, match{kind: "function", name: tsArrowRe.FindStringSubmatch(l)[1], line: i + 1})
+		case tsFnExprRe.MatchString(l):
+			ms = append(ms, match{kind: "function", name: tsFnExprRe.FindStringSubmatch(l)[1], line: i + 1})
+		}
+	}
+	return ms
+}
+
+func matchMarkdown(lines []string) []match {
+	var ms []match
+	for i, l := range lines {
+		if m := mdHeadingRe.FindStringSubmatch(l); m != nil {
+			ms = append(ms, match{kind: "doc", name: m[2], line: i + 1, indent: len(m[1])})
+		}
+	}
+	return ms
+}
+
+// mdSectionEnds resolves the line range of every markdown heading: a section
+// runs from its heading line to just before the next heading of the SAME or a
+// HIGHER level, so a section never contains a sibling's body.
+//
+// The old rule stopped at the next strictly HIGHER level, which made every
+// `##` of a document reach past all of its following siblings: on the live
+// leankg store the 249 markdown files (3,407,965 B on disk) expanded to
+// 14,545,212 B of `doc` content, 4.27x, and the worst file
+// (docs/archive/workflow-opencode-agent.md, 19,509 B on disk) expanded to
+// 290,340 B, 14.9x.
+func mdSectionEnds(ms []match, nlines int) []int {
+	ends := make([]int, len(ms))
+	for i, m := range ms {
+		end := nlines
+		for j := i + 1; j < len(ms); j++ {
+			if ms[j].indent <= m.indent {
+				end = ms[j].line - 1
+				break
+			}
+		}
+		if end < m.line {
+			end = m.line
+		}
+		ends[i] = end
+	}
+	return ends
+}
+
+// markdownContent fills the stored text of every markdown element.
+//
+// The shape: ONE element per heading, and a heading's text is its OWN lines
+// plus the TITLES of its descendant headings, never a descendant's body. The
+// document's own top-level heading keeps the WHOLE document, so
+// document-level summarization keeps working. Every other heading keeps its
+// own text, which lands the total at about 2x the source size instead of the
+// 4.27x the ancestor-copy shape produced (the same paragraph used to be
+// stored once per ancestor).
+func markdownContent(els []indexedElem, ms []match, ends []int, lines []string) {
+	owner := mdDocOwner(ms)
+	for i := range els {
+		if i == owner {
+			// The document owner holds the whole document, preamble included.
+			els[i].start = 1
+			els[i].end = len(lines)
+			els[i].content = store.ClipUTF8(strings.Join(lines, "\n"), maxContent)
+			continue
+		}
+		keep := mdKeepLines(i, ms, ends)
+		parts := make([]string, 0, len(keep))
+		for _, ln := range keep {
+			parts = append(parts, lines[ln-1])
+		}
+		els[i].content = store.ClipUTF8(strings.Join(parts, "\n"), maxContent)
+	}
+}
+
+// mdDocOwner returns the index of the heading that owns the document: the
+// first heading of the file's top level (the lowest heading level present).
+// A file that starts at `##` has no `#` title, and its first heading plays
+// that role, so document-level summarization keeps working for it too.
+func mdDocOwner(ms []match) int {
+	if len(ms) == 0 {
+		return -1
+	}
+	owner := 0
+	for i, m := range ms {
+		if m.indent < ms[owner].indent {
+			owner = i
+		}
+	}
+	return owner
+}
+
+// mdKeepLines returns the lines one markdown heading stores: its own lines
+// plus the titles of its descendant headings, never a descendant's body.
+func mdKeepLines(i int, ms []match, ends []int) []int {
+	start, end := ms[i].line, ends[i]
+	keep := make([]int, 0, end-start+1)
+	for ln := start; ln <= end; ln++ {
+		if ln == start || mdIsDescendantTitle(i, ms, ends, ln) || !mdInDescendantBody(i, ms, ends, ln) {
+			keep = append(keep, ln)
+		}
+	}
+	return keep
+}
+
+// mdInDescendantBody reports whether the line falls inside the BODY of one of
+// the heading's descendants. An ancestor must not store that text a second
+// time: the descendant's own element holds it.
+func mdInDescendantBody(i int, ms []match, ends []int, line int) bool {
+	for j := i + 1; j < len(ms) && ms[j].line <= ends[i]; j++ {
+		if line > ms[j].line && line <= ends[j] {
+			return true
+		}
+	}
+	return false
+}
+
+// mdIsDescendantTitle reports whether the line is the heading line of one of
+// the heading's descendants. A title is the outline of the section and is
+// kept; a body is not.
+func mdIsDescendantTitle(i int, ms []match, ends []int, line int) bool {
+	for j := i + 1; j < len(ms) && ms[j].line <= ends[i]; j++ {
+		if ms[j].line == line {
+			return true
+		}
+	}
+	return false
+}
+
+// mdUniqueNames disambiguates repeated heading titles inside one file. Two
+// headings with the same text ("## Notes" twice) would share a qualified
+// name, and the store's UNIQUE index on qualified_name would silently drop
+// one of them: the file would hold fewer elements than it has headings. The
+// suffix mirrors the doc indexer's own slug disambiguation.
+func mdUniqueNames(els []indexedElem) {
+	used := make(map[string]bool, len(els))
+	for i := range els {
+		q := els[i].qn
+		if !used[q] {
+			used[q] = true
+			continue
+		}
+		for n := 2; ; n++ {
+			cand := q + " (" + strconv.Itoa(n) + ")"
+			if !used[cand] {
+				els[i].qn = cand
+				used[cand] = true
+				break
+			}
+		}
+	}
+}
+
+func matchJava(lines []string) []match {
+	var ms []match
+	for i, l := range lines {
+		if m := javaTypeRe.FindStringSubmatch(l); m != nil {
+			ms = append(ms, match{kind: "class", name: m[2], line: i + 1})
+			continue
+		}
+		if m := javaMethodRe.FindStringSubmatch(l); m != nil && !javaKeyword(m[1]) {
+			ms = append(ms, match{kind: "method", name: m[1], line: i + 1})
+		}
+	}
+	return ms
+}
+
+// javaKeyword rejects method-shaped Java keywords ("return", "throw", ...).
+func javaKeyword(name string) bool {
+	switch name {
+	case "if", "else", "for", "while", "do", "switch", "catch", "return",
+		"throw", "synchronized", "try", "new", "assert":
+		return true
+	}
+	return false
+}
+
+func matchKotlin(lines []string) []match {
+	var ms []match
+	for i, l := range lines {
+		if m := ktTypeRe.FindStringSubmatch(l); m != nil {
+			ms = append(ms, match{kind: "class", name: m[2], line: i + 1})
+			continue
+		}
+		if m := ktFuncRe.FindStringSubmatch(l); m != nil {
+			ms = append(ms, match{kind: "function", name: m[1], line: i + 1})
+		}
+	}
+	return ms
+}
+
+func matchSwift(lines []string) []match {
+	var ms []match
+	for i, l := range lines {
+		if m := swiftTypeRe.FindStringSubmatch(l); m != nil {
+			ms = append(ms, match{kind: "class", name: m[2], line: i + 1})
+			continue
+		}
+		if m := swiftFuncRe.FindStringSubmatch(l); m != nil {
+			ms = append(ms, match{kind: "method", name: m[1], line: i + 1})
+		}
+	}
+	return ms
+}
+
+func matchObjC(lines []string) []match {
+	var ms []match
+	for i, l := range lines {
+		if m := objcTypeRe.FindStringSubmatch(l); m != nil {
+			ms = append(ms, match{kind: "class", name: m[2], line: i + 1})
+			continue
+		}
+		if m := objcMethodRe.FindStringSubmatch(l); m != nil {
+			ms = append(ms, match{kind: "method", name: m[3], line: i + 1, recv: m[2]})
+		}
+	}
+	return ms
+}
+
+// matchDart extracts dart classes, mixins, enums, functions, constructors
+// (default, named, factory and const — named without the class, matching the
+// tree-sitter tier) and enum values. Constructors and values carry their
+// owning type in recv (see qualify), which keeps their qualified names stable
+// whether or not the class or enum body spans several lines.
+func matchDart(lines []string) []match {
+	var ms []match
+	inEnum, enumName := false, ""
+	for i, l := range lines {
+		if m := dartTypeRe.FindStringSubmatch(l); m != nil {
+			ms = append(ms, match{kind: "class", name: m[2], line: i + 1})
+			if m[1] == "enum" {
+				// Values sit on the declaration line for the one-line form and
+				// in the body lines below otherwise, up to the closing brace.
+				enumName = m[2]
+				ms = append(ms, dartEnumValues(l, i+1, enumName)...)
+				inEnum = !strings.Contains(l, "}")
+			}
+			continue
+		}
+		if inEnum {
+			if vals := dartEnumValues(l, i+1, enumName); len(vals) > 0 {
+				ms = append(ms, vals...)
+				continue
+			}
+			if strings.Contains(l, "}") {
+				inEnum, enumName = false, ""
+			}
+			continue
+		}
+		if m := dartCtorRe.FindStringSubmatch(l); m != nil {
+			name := m[2] // named/factory constructor: the part after the dot
+			if name == "" {
+				name = m[1]
+			}
+			// The class name rides in recv so a default constructor's qualified
+			// name ("<file>::Factory.Factory") cannot collide with the class
+			// element's own row, whatever the heuristic end line resolved to.
+			ms = append(ms, match{kind: "constructor", name: name, recv: m[1], line: i + 1})
+			continue
+		}
+		if m := dartFuncRe.FindStringSubmatch(l); m != nil && !dartKeyword(m[1]) {
+			ms = append(ms, match{kind: "function", name: m[1], line: i + 1})
+		}
+	}
+	return ms
+}
+
+// dartEnumValues extracts the value names carried by one line of a dart enum:
+// the value list is everything up to the ";" that separates it from the
+// members, so a member line (a field, a constructor, a method body) yields
+// nothing. The enum's own name rides in recv, giving "<file>::Color.red".
+func dartEnumValues(line string, lineNo int, enumName string) []match {
+	s := line
+	if p := strings.IndexByte(s, '}'); p >= 0 {
+		s = s[:p]
+	}
+	if p := strings.IndexByte(s, '{'); p >= 0 {
+		s = s[p+1:]
+	}
+	if p := strings.IndexByte(s, ';'); p >= 0 {
+		s = s[:p]
+	}
+	var out []match
+	for _, part := range strings.Split(s, ",") {
+		part = strings.TrimSpace(part)
+		if i := strings.IndexAny(part, "(="); i >= 0 { // "ok(1)", "red = 1"
+			part = strings.TrimSpace(part[:i])
+		}
+		if !dartEnumConstantRe.MatchString(part) {
+			continue
+		}
+		out = append(out, match{kind: "constant", name: part, recv: enumName, line: lineNo})
+	}
+	return out
+}
+
+// dartKeyword rejects function-shaped Dart keywords ("if", "for", "while", ...).
+func dartKeyword(name string) bool {
+	switch name {
+	case "if", "else", "for", "while", "switch", "catch", "return", "throw",
+		"print", "new", "assert", "do":
+		return true
+	}
+	return false
+}
+
+// assignParents sets parent to the innermost enclosing element by line
+// containment (strictly earlier start, range covering the child start).
+func assignParents(els []indexedElem) {
+	for i := range els {
+		best := -1
+		for j := range els {
+			if j == i || els[j].start >= els[i].start || els[j].end < els[i].start {
+				continue
+			}
+			if best == -1 || els[j].start > els[best].start {
+				best = j
+			}
+		}
+		els[i].parent = best
+	}
+}
+
+// qualify assigns element kinds (Python def-in-class becomes a method) and
+// qualified names: `<rel>::<name>`, class and enum members
+// `<rel>::<Type>.<name>` (methods and constructors; enum values, whose recv
+// holds the enum name — named members keep their owning type even when the
+// declaring body sits on a single line, where line-based parent detection
+// finds no parent).
+func qualify(fe fileElements) {
+	for i := range fe.elements {
+		e := &fe.elements[i]
+		if e.etype == "function" && e.lang == "py" && e.parent >= 0 &&
+			fe.elements[e.parent].etype == "class" {
+			e.etype = "method"
+		}
+		base := fe.rel + "::"
+		if e.etype == "method" || e.etype == "constructor" || e.etype == "constant" {
+			typeName := e.recv
+			if typeName == "" && e.parent >= 0 {
+				pqn := fe.elements[e.parent].qn
+				if p := strings.LastIndex(pqn, "::"); p >= 0 {
+					typeName = pqn[p+2:]
+				}
+			}
+			if typeName != "" {
+				base += typeName + "."
+			}
+		}
+		e.qn = base + e.name
+	}
+}
+
+// lexState is what a line leaves open for the next one: inside a block comment,
+// or inside a backtick string (a Go raw string, a JS/TS template literal). Either
+// can run across lines.
+type lexState struct{ block, raw bool }
+
+// backtickLangs are the languages whose backtick strings may span lines.
+var backtickLangs = map[string]bool{"go": true, "js": true, "jsx": true, "ts": true, "tsx": true}
+
+// scrub returns line without its comments, using the language's own comment
+// syntax from commentStyles: "//" is a comment in Go and floor division in
+// Python, and "#" is a comment in Python with or without a space after it.
+// Quoted strings are kept, or dropped when blank is set, so a brace inside one
+// is not counted. st advances across the line, carrying a block comment or a
+// backtick string left open here into the next line.
+func (st *lexState) scrub(line, lang string, blank bool) string {
+	style := commentStyles[lang]
+	var b strings.Builder
+	emit := func(s string) {
+		if !blank {
+			b.WriteString(s)
+		}
+	}
+	for i := 0; i < len(line); {
+		rest := line[i:]
+		switch {
+		case st.block:
+			end := strings.Index(rest, "*/")
+			if end < 0 {
+				return b.String()
+			}
+			st.block = false
+			i += end + 2
+		case st.raw:
+			end := strings.IndexByte(rest, '`')
+			if end < 0 {
+				emit(rest)
+				return b.String()
+			}
+			st.raw = false
+			emit(rest[:end+1])
+			i += end + 1
+		case style.block && strings.HasPrefix(rest, "/*"):
+			st.block = true
+			i += 2
+		case slices.ContainsFunc(style.line, func(p string) bool { return strings.HasPrefix(rest, p) }):
+			return b.String()
+		case rest[0] == '`' && backtickLangs[lang]:
+			st.raw = true
+			emit("`")
+			i++
+		case rest[0] == '"' || rest[0] == '\'':
+			n := quotedLen(rest)
+			if n == 0 {
+				n = 1 // an unmatched quote is plain text
+			}
+			emit(rest[:n])
+			i += n
+		default:
+			emit(rest[:1])
+			i++
+		}
+	}
+	return b.String()
+}
+
+// quotedLen returns the length of the quoted literal that opens s, or 0 when it
+// does not close on the same line.
+func quotedLen(s string) int {
+	for j := 1; j < len(s); j++ {
+		switch s[j] {
+		case '\\':
+			j++
+		case s[0]:
+			return j + 1
+		}
+	}
+	return 0
+}
+
+// stripComments returns code without its comments; string literals stay. code is
+// a whole element's content, so a block comment can span its lines.
+func stripComments(code, lang string) string {
+	var st lexState
+	lines := strings.Split(code, "\n")
+	for i, line := range lines {
+		lines[i] = st.scrub(line, lang, false)
+	}
+	return strings.Join(lines, "\n")
+}
+
+// closingBraceLine returns the line (1-based) on which the block opened at or
+// below start closes, looking no further than limit. It returns 0 when no block
+// closes inside that window: a brace-less declaration, or a block that runs past
+// limit (a class whose methods follow it), so the caller keeps its own bound.
+// Comments and string literals hold no braces, including a block comment or a
+// template literal that spans lines.
+func closingBraceLine(lines []string, lang string, start, limit int) int {
+	var st lexState
+	depth, opened := 0, false
+	for n := start; n <= limit && n <= len(lines); n++ {
+		text := st.scrub(lines[n-1], lang, true)
+		opens := strings.Count(text, "{")
+		depth += opens - strings.Count(text, "}")
+		if depth > 0 {
+			opened = true
+		}
+		// A line that opens and closes the body (`func f() {}`, or a signature
+		// ending `) {}`) ends the element there. A net-zero line that does not
+		// end in `}` is still signature (`seen map[string]struct{},`).
+		oneLine := opens > 0 && strings.HasSuffix(strings.TrimSpace(text), "}")
+		if depth <= 0 && (opened || oneLine) {
+			return n
+		}
+	}
+	return 0
+}
+
+// trimTrailingComments backs end off over the blank and comment lines at its
+// tail. They open the next declaration's documentation, not this element's
+// body. start is never trimmed past.
+func trimTrailingComments(lines []string, start, end int) int {
+	for end > start && (strings.TrimSpace(lines[end-1]) == "" || isDocCommentLine(lines[end-1])) {
+		end--
+	}
+	return end
+}
+
+// boundContent fills Content from the source lines, bounded 8000 chars.
+//
+// Content LEADS with the element's own doc comment. `start` is the `func`/
+// `type` line, so the `//` block an author wrote ABOVE it was never in the
+// store — and that block is the prose a question is a paraphrase of. Measured
+// on this repository (wave 9 of the dogfood loop): 2,596 of 4,175 Go elements
+// (62%) have a doc comment the engine could not see, and of the 17 labelled
+// questions no arm could reach, nine were the doc comment verbatim minus the
+// symbol name. Adding it moved the pure-vector top-10 from 36/84 to 71/84 with
+// zero regressions (numbers and rationale in internal/index/doccapture_test.go;
+// the comment leads rather than trails because the local sidecar truncates to a
+// 1000-rune budget and a leading explanation survives it).
+//
+// The slice GROWS (lines[docStart-1:e]), so a body is never shortened to make
+// room, and an element with no comment is byte-identical to what it was.
+func boundContent(els []indexedElem, lines []string) {
+	for i := range els {
+		s, e := els[i].start, els[i].end
+		if s < 1 {
+			s = 1
+		}
+		if e > len(lines) {
+			e = len(lines)
+		}
+		if doc := docCommentStart(lines, s); doc < s {
+			s = doc
+		}
+		els[i].content = strings.Join(lines[s-1:e], "\n")
+		if els[i].etype != "doc" {
+			if doc := leadingDoc(lines, s, els[i].lang); doc != "" {
+				els[i].content = doc + "\n" + els[i].content
+				els[i].docLen = len(doc) + 1
+			}
+		}
+		els[i].content = store.ClipUTF8(els[i].content, maxContent)
+	}
+}
+
+// docCommentStart walks back from line `start` over a CONTIGUOUS comment block
+// directly above it and returns that block's first line (start itself when there
+// is none). Contiguity is the rule: a blank line or a second declaration ends
+// the block, so a comment belonging to the PREVIOUS element is never stolen.
+//
+// Recognised forms are the ones the indexed languages use: `//`, `///`, `//!`,
+// `#`, and a `/* … */` block. Anything else stops the walk.
+func docCommentStart(lines []string, start int) int {
+	if start < 2 || start > len(lines) {
+		return start
+	}
+	// `start` is 1-based, so the line above it is index start-2 in the 0-based
+	// slice below.
+	i := start - 2
+	// A /* … */ block that ends on the line above. Having SEEN the terminator we
+	// know a block is open, and everything up to its `/*` is that block's body —
+	// a block comment cannot contain code, so no per-line filtering is needed or
+	// correct here (interior lines are conventionally " * …" but may be
+	// anything, and a stricter walk strands the block). A `//` run sitting
+	// directly on top of the block belongs to the same documentation unit, and
+	// this loop walks up through it naturally.
+	if strings.HasSuffix(strings.TrimSpace(lines[i]), "*/") {
+		for k := i; k >= 0; k-- {
+			if strings.Contains(lines[k], "/*") {
+				return k + 1
+			}
+		}
+		// Malformed — no opening delimiter above. Take nothing rather than
+		// guess and swallow unrelated lines.
+		return start
+	}
+	// Otherwise a run of single-line comment lines.
+	j := i
+	for j >= 0 && isDocCommentLine(lines[j]) {
+		j--
+	}
+	return j + 2
+}
+
+// isDocCommentLine reports whether one source line is a single-line doc comment
+// in a language the registry indexes.
+func isDocCommentLine(line string) bool {
+	t := strings.TrimSpace(line)
+	switch {
+	case strings.HasPrefix(t, "//"), strings.HasPrefix(t, "#"):
+		return true
+	case strings.HasPrefix(t, "*") && strings.HasSuffix(t, "*/"):
+		return true
+	}
+	return false
+}
+
+func extOf(rel string) string {
+	if p := strings.LastIndex(rel, "."); p >= 0 {
+		return rel[p:]
+	}
+	return ""
+}

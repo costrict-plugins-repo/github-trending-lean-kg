@@ -1,0 +1,65 @@
+package main
+
+import (
+	"net/http"
+	"sync"
+
+	"github.com/FreePeak/LeanKG/internal/httpx"
+	"github.com/FreePeak/LeanKG/internal/projects"
+)
+
+// projectRouting wraps a default handler with per-project dispatch: a
+// non-empty `project` query parameter selects the project's own handler
+// (built lazily from the router's registry — LEANKG_PROJECT_DIRS);
+// requests WITHOUT the parameter go to the default handler untouched, so
+// the single-project serving path is byte-identical to a router-less
+// process.
+type projectRouting struct {
+	router   *projects.Router
+	fallback http.Handler
+	build    func(*projects.Project) http.Handler
+
+	mu    sync.Mutex
+	cache map[string]http.Handler // project dir -> built handler
+}
+
+// routeByProject wraps fallback with `?project=` dispatch. build mounts
+// one transport handler over a project's engine (e.g. rest.Handler or
+// leankgmcp.New(engine).HTTPHandler()). The router keeps no context: each
+// request opens its project on that request's own context, and a request
+// whose client has gone away is refused before anything is opened.
+func routeByProject(router *projects.Router, fallback http.Handler, build func(*projects.Project) http.Handler) http.Handler {
+	return httpx.Guard(&projectRouting{
+		router:   router,
+		fallback: fallback,
+		build:    build,
+		cache:    map[string]http.Handler{},
+	})
+}
+
+func (h *projectRouting) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	sel := r.URL.Query().Get("project")
+	if sel == "" {
+		h.fallback.ServeHTTP(w, r)
+		return
+	}
+	p, err := h.router.Open(r.Context(), sel)
+	if err != nil {
+		// FR-ZCP-02: an unknown project is refused as a 404, never routed to the default.
+		httpx.WriteMessage(w, http.StatusNotFound, err.Error())
+		return
+	}
+	h.handlerFor(p).ServeHTTP(w, r)
+}
+
+// handlerFor builds (once) the transport handler for a project.
+func (h *projectRouting) handlerFor(p *projects.Project) http.Handler {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if got, ok := h.cache[p.Dir]; ok {
+		return got
+	}
+	built := h.build(p)
+	h.cache[p.Dir] = built
+	return built
+}

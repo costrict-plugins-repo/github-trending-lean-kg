@@ -1,0 +1,93 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 400" width="1280" height="400" role="img" aria-labelledby="t d">
+  <title id="t">LeanKG</title>
+  <desc id="d">LeanKG: code knowledge graph for AI agents. Self-hosted, access-controlled, multi-repo.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0D1424"/>
+      <stop offset="1" stop-color="#0A0F1D"/>
+    </linearGradient>
+    <linearGradient id="tile" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1A2744"/>
+      <stop offset="1" stop-color="#0B1120"/>
+    </linearGradient>
+    <radialGradient id="halo" cx="1040" cy="210" r="380" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#5EEAD4" stop-opacity=".16"/>
+      <stop offset="1" stop-color="#5EEAD4" stop-opacity="0"/>
+    </radialGradient>
+    <pattern id="dots" width="24" height="24" patternUnits="userSpaceOnUse">
+      <circle cx="2" cy="2" r="1" fill="#22304F"/>
+    </pattern>
+    <filter id="glow" x="-60%" y="-60%" width="220%" height="220%">
+      <feGaussianBlur stdDeviation="4" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <filter id="markglow" x="-60%" y="-60%" width="220%" height="220%">
+      <feGaussianBlur stdDeviation="2" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <g id="mark">
+      <rect width="64" height="64" rx="14" fill="url(#tile)"/>
+      <rect x=".5" y=".5" width="63" height="63" rx="13.5" fill="none" stroke="#2A3A5E"/>
+      <g fill="none" stroke-width="4" stroke-linecap="round">
+        <path d="M21 15V49" stroke="#F4F7FB"/>
+        <path d="M21 32L44 49" stroke="#8FA3C7"/>
+        <path d="M21 32L44 15" stroke="#5EEAD4"/>
+      </g>
+      <circle cx="44" cy="15" r="5.5" fill="#5EEAD4" filter="url(#markglow)"/>
+      <circle cx="44" cy="49" r="5" fill="#0B1120" stroke="#8FA3C7" stroke-width="2.5"/>
+      <circle cx="21" cy="32" r="6.5" fill="#F4F7FB" stroke="#0B1120" stroke-width="2.5"/>
+    </g>
+  </defs>
+
+  <rect width="1280" height="400" rx="20" fill="url(#bg)"/>
+  <rect width="1280" height="400" rx="20" fill="url(#dots)" opacity=".55"/>
+  <rect width="1280" height="400" rx="20" fill="url(#halo)"/>
+
+  <!-- Repository graph: everything an agent could read -->
+  <g stroke="#26365A" stroke-width="1.5" fill="none">
+    <path d="M760 70L850 48L950 84L1060 52L1160 96L1220 190L1150 300L1040 340L920 345L820 350L740 290L700 190L760 70"/>
+    <path d="M770 170L760 70M770 170L700 190M770 170L880 150M880 150L950 84"/>
+    <path d="M880 150L900 210M770 170L900 210M920 345L900 210M740 290L900 210"/>
+    <path d="M880 150L1000 160M950 84L1090 120M1060 52L1090 120M1160 96L1110 205M1220 190L1110 205M1150 300L1110 205"/>
+    <path d="M1040 340L985 320M920 345L985 320"/>
+  </g>
+  <g fill="#121B30" stroke="#3A4C75" stroke-width="1.5">
+    <circle cx="760" cy="70" r="6"/><circle cx="850" cy="48" r="5"/><circle cx="950" cy="84" r="6"/>
+    <circle cx="1060" cy="52" r="7"/><circle cx="1160" cy="96" r="6"/><circle cx="1220" cy="190" r="8"/>
+    <circle cx="1150" cy="300" r="6"/><circle cx="1040" cy="340" r="7"/><circle cx="920" cy="345" r="6"/>
+    <circle cx="820" cy="350" r="5"/><circle cx="740" cy="290" r="7"/><circle cx="700" cy="190" r="6"/>
+    <circle cx="770" cy="170" r="8"/><circle cx="880" cy="150" r="6"/>
+  </g>
+
+  <!-- Retrieved subgraph: what the agent is given -->
+  <circle cx="1040" cy="210" r="160" fill="none" stroke="#5EEAD4" stroke-width="1.5" stroke-dasharray="3 7" opacity=".4"/>
+  <g stroke="#5EEAD4" stroke-width="2.5" stroke-linecap="round" fill="none" opacity=".95">
+    <path d="M900 210L1000 160M900 210L1010 260M1000 160L1110 205M1010 260L1110 205M1000 160L1090 120M1010 260L985 320"/>
+  </g>
+  <g fill="#5EEAD4" filter="url(#glow)">
+    <circle cx="1000" cy="160" r="7"/><circle cx="1010" cy="260" r="7"/><circle cx="1110" cy="205" r="9"/>
+    <circle cx="1090" cy="120" r="6"/><circle cx="985" cy="320" r="6"/>
+  </g>
+  <circle cx="900" cy="210" r="13" fill="#0D1424" stroke="#5EEAD4" stroke-width="2.5"/>
+  <circle cx="900" cy="210" r="5" fill="#5EEAD4"/>
+  <g font-family="'Inter','SF Pro Text','Segoe UI','Helvetica Neue',Arial,sans-serif" font-size="13" fill="#6B7FA8" text-anchor="middle">
+    <text x="900" y="244">query</text>
+    <text x="1040" y="388">subgraph returned to the agent</text>
+  </g>
+
+  <!-- Identity -->
+  <use href="#mark" transform="translate(72 62) scale(1.375)"/>
+  <g font-family="'Inter','SF Pro Display','Segoe UI','Helvetica Neue',Arial,sans-serif">
+    <text x="178" y="138" font-size="76" font-weight="700" letter-spacing="-2" fill="#F4F7FB">LeanKG</text>
+    <text x="72" y="214" font-size="30" font-weight="500" fill="#F4F7FB">Code knowledge graph for AI agents</text>
+    <text x="72" y="252" font-size="20" font-weight="400" fill="#8FA3C7">Self-hosted. Access-controlled. Multi-repo.</text>
+    <g font-size="14" font-weight="500" fill="#AFC0DD" text-anchor="middle">
+      <rect x="72" y="288" width="72" height="30" rx="15" fill="none" stroke="#2A3A5E"/>
+      <text x="108" y="308">MCP</text>
+      <rect x="156" y="288" width="196" height="30" rx="15" fill="none" stroke="#2A3A5E"/>
+      <text x="254" y="308">SQLite or PostgreSQL</text>
+      <rect x="364" y="288" width="160" height="30" rx="15" fill="none" stroke="#2A3A5E"/>
+      <text x="444" y="308">Single Go binary</text>
+    </g>
+  </g>
+</svg>

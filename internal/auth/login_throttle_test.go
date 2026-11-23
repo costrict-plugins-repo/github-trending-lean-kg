@@ -1,0 +1,138 @@
+package auth
+
+import (
+	"sync"
+	"testing"
+	"time"
+)
+
+// fakeClock is the injectable clock the throttle reads; tests move it forward
+// instead of sleeping.
+type fakeClock struct{ now time.Time }
+
+func (c *fakeClock) Now() time.Time { return c.now }
+
+func (c *fakeClock) Advance(d time.Duration) { c.now = c.now.Add(d) }
+
+func newTestThrottle() (*LoginThrottle, *fakeClock) {
+	clock := &fakeClock{now: time.Unix(1_000_000, 0)}
+	return NewLoginThrottle(clock.Now), clock
+}
+
+// failN counts n attempts through Reserve, the path a real login takes.
+func failN(th *LoginThrottle, user string, n int) {
+	for i := 0; i < n; i++ {
+		th.Reserve(user)
+	}
+}
+
+func TestLoginThrottleLocksAfterFiveFailures(t *testing.T) {
+	th, _ := newTestThrottle()
+	failN(th, "admin", 4)
+	if !th.Reserve("admin") {
+		t.Fatal("the 5th attempt must still be allowed")
+	}
+	if th.Reserve("admin") {
+		t.Fatal("the 5th consecutive failure must lock the username")
+	}
+	if !th.Reserve("someone-else") {
+		t.Fatal("a lockout must be per username")
+	}
+}
+
+func TestLoginThrottleLockoutLastsSixtySeconds(t *testing.T) {
+	th, clock := newTestThrottle()
+	failN(th, "admin", 5)
+
+	clock.Advance(59 * time.Second)
+	if th.Reserve("admin") {
+		t.Fatal("lockout must still hold at 59s")
+	}
+	clock.Advance(time.Second)
+	if !th.Reserve("admin") {
+		t.Fatal("lockout must end at 60s")
+	}
+}
+
+func TestLoginThrottleOneFailureAfterLockoutDoesNotRelock(t *testing.T) {
+	th, clock := newTestThrottle()
+	failN(th, "admin", 5)
+	clock.Advance(60 * time.Second)
+
+	if !th.Reserve("admin") {
+		t.Fatal("the first attempt after the lockout expires must be allowed")
+	}
+	if !th.Reserve("admin") {
+		t.Fatal("after a lockout expires the streak restarts: one failure must not relock")
+	}
+}
+
+func TestLoginThrottleSuccessResetsStreak(t *testing.T) {
+	th, _ := newTestThrottle()
+	failN(th, "admin", 4)
+	th.Success("admin")
+	failN(th, "admin", 4)
+	if !th.Reserve("admin") {
+		t.Fatal("a success must reset the consecutive-failure count")
+	}
+}
+
+func TestLoginThrottleStreakExpiresOutsideWindow(t *testing.T) {
+	th, clock := newTestThrottle()
+	failN(th, "admin", 4)
+	clock.Advance(loginFailWindow + time.Second)
+	failN(th, "admin", 4)
+	if !th.Reserve("admin") {
+		t.Fatal("failures spread beyond the window must not add up to a lockout")
+	}
+}
+
+func TestLoginThrottleSweepsStaleEntries(t *testing.T) {
+	th, clock := newTestThrottle()
+	for i := 0; i < 100; i++ {
+		th.Reserve(string(rune('a'+i%26)) + string(rune('a'+i/26)))
+	}
+	clock.Advance(loginFailWindow + time.Second)
+	th.Reserve("fresh")
+	if n := len(th.entries); n != 1 {
+		t.Fatalf("stale entries must be swept: %d left, want 1", n)
+	}
+}
+
+func TestLoginThrottleConcurrentUse(t *testing.T) {
+	th, _ := newTestThrottle()
+	var wg sync.WaitGroup
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			th.Reserve("admin")
+		}()
+	}
+	wg.Wait()
+	if th.Reserve("admin") {
+		t.Fatal("50 concurrent attempts must lock the username")
+	}
+}
+
+// TestLoginThrottleReleaseUndoesOneAttempt pins #601 S1: an attempt that never
+// reached a credential check gives its counted failure back, and the lockout it
+// started ends with it.
+func TestLoginThrottleReleaseUndoesOneAttempt(t *testing.T) {
+	th, _ := newTestThrottle()
+	failN(th, "admin", 4)
+	if !th.Reserve("admin") {
+		t.Fatal("the 5th attempt must be allowed")
+	}
+	if th.Reserve("admin") {
+		t.Fatal("the 5th failure must lock the username")
+	}
+
+	th.Release("admin")
+	if st := th.entries["admin"]; st == nil || st.failures != 4 || !st.lockedUntil.IsZero() {
+		t.Fatalf("after release the streak must be 4 and unlocked, got %+v", st)
+	}
+	if !th.Reserve("admin") {
+		t.Fatal("releasing the 5th attempt must end its lockout")
+	}
+}
